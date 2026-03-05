@@ -18,7 +18,7 @@ pub mod swipe;
 pub mod temperature;
 pub mod zones;
 
-pub fn show_effect_ui(ui: &mut egui::Ui, profile: &mut Profile, update_lights: &mut bool, theme: &crate::gui::style::Theme) {
+pub fn show_effect_ui(ui: &mut egui::Ui, profile: &mut Profile, update_lights: &mut bool, theme: &crate::gui::style::Theme, is_dynamic_lighting: bool) {
     let mut effect = profile.effect;
 
     match &mut effect {
@@ -26,7 +26,7 @@ pub fn show_effect_ui(ui: &mut egui::Ui, profile: &mut Profile, update_lights: &
             ui.scope(|ui| {
                 ui.style_mut().spacing.item_spacing = theme.spacing.default;
 
-                show_brightness(ui, profile, update_lights);
+                show_brightness(ui, profile, update_lights, is_dynamic_lighting);
                 show_direction(ui, profile, update_lights);
                 show_effect_settings(ui, profile, update_lights);
                 ComboBox::from_label("Swipe mode").width(30.0).selected_text(format!("{:?}", mode)).show_ui(ui, |ui| {
@@ -41,7 +41,7 @@ pub fn show_effect_ui(ui: &mut egui::Ui, profile: &mut Profile, update_lights: &
             ui.scope(|ui| {
                 ui.style_mut().spacing.item_spacing = theme.spacing.default;
 
-                show_brightness(ui, profile, update_lights);
+                show_brightness(ui, profile, update_lights, is_dynamic_lighting);
                 show_direction(ui, profile, update_lights);
 
                 ui.horizontal(|ui| {
@@ -55,7 +55,7 @@ pub fn show_effect_ui(ui: &mut egui::Ui, profile: &mut Profile, update_lights: &
             });
         }
         _ => {
-            default_ui::show(ui, profile, update_lights, &theme.spacing);
+            default_ui::show(ui, profile, update_lights, &theme.spacing, is_dynamic_lighting);
         }
     }
 

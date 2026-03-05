@@ -43,6 +43,13 @@ pub fn manager_error(ctx: &Context) -> bool {
                 });
             });
 
+            #[cfg(target_os = "windows")]
+            ui.vertical(|ui| {
+                Frame::NONE.inner_margin(ModalStyle::default().body_margin).show(ui, |ui| {
+                    ui.colored_label(Color32::from_hex("#ff9900").unwrap(), "On Windows, try running the application as Administrator.");
+                });
+            });
+
             modal.body(ui, "In certain cases, this may be due to a driver or hardware error.");
 
             if let Ok(list) = legion_rgb_driver::find_possible_keyboards() {

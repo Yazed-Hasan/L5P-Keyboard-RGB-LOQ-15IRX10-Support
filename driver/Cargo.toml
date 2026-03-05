@@ -8,3 +8,13 @@ thiserror = "2.0.12"
 hidapi = { version = "2.6.3", default-features = false, features = [
     "linux-static-libusb",
 ] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Devices_Lights",
+    "Devices_Lights_Effects",
+    "Devices_Enumeration",
+    "Foundation",
+    "Foundation_Collections",
+    "UI",
+] }

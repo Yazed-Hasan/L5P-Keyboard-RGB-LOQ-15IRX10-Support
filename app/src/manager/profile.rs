@@ -34,6 +34,12 @@ pub struct Profile {
     pub direction: Direction,
     pub speed: u8,
     pub brightness: Brightness,
+    #[serde(default = "default_brightness_level")]
+    pub brightness_level: u8,
+}
+
+fn default_brightness_level() -> u8 {
+    50
 }
 
 impl Default for Profile {
@@ -45,6 +51,7 @@ impl Default for Profile {
             direction: Direction::default(),
             speed: 1,
             brightness: Brightness::default(),
+            brightness_level: 50,
         }
     }
 }

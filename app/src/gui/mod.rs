@@ -44,6 +44,7 @@ pub struct App {
     visible: Arc<AtomicBool>,
 
     manager: Option<EffectManager>,
+    is_dynamic_lighting: bool,
     state_changed: bool,
     loaded_effect: LoadedEffect,
     current_profile: Profile,
@@ -115,6 +116,7 @@ impl App {
         };
 
         let manager = manager_result.ok();
+        let is_dynamic_lighting = manager.as_ref().map_or(false, |m| m.is_dynamic_lighting);
 
         let settings: Settings = Settings::load();
         let Settings { current_profile, profiles, effects } = settings;
@@ -130,6 +132,7 @@ impl App {
             visible,
 
             manager,
+            is_dynamic_lighting,
             // Default to true for an instant update on launch
             state_changed: true,
             loaded_effect: LoadedEffect::default(),
@@ -383,7 +386,7 @@ impl App {
 
     fn show_effect_ui(&mut self, ui: &mut eframe::egui::Ui) {
         ui.add_enabled_ui(self.loaded_effect.is_none(), |ui| {
-            show_effect_ui(ui, &mut self.current_profile, &mut self.state_changed, &self.theme);
+            show_effect_ui(ui, &mut self.current_profile, &mut self.state_changed, &self.theme, self.is_dynamic_lighting);
         });
     }
 

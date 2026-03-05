@@ -214,6 +214,7 @@ fn parse_cli() -> Result<CliOutput, CliError> {
                     direction,
                     speed,
                     brightness,
+                    brightness_level: 50,
                 };
 
                 if let Some(filename) = save {
