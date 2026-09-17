@@ -50,6 +50,7 @@ You may also download pre-compiled versions from [here](https://github.com/4JX/L
 
 - **Lightning:** Adds a little _spark_.
 - **AmbientLight:** Reacts to content on your screen.
+- **Audio React:** Reacts to system playback (WASAPI loopback) with sensitivity, smoothness, idle glow, per-band gain, color mode, and style.
 - **Smooth(Left/Right)Wave:** An implementation of the classic wave effect.
 - **(Left/Right)Swipe:** Transitions the selected colors from side to side, useful for custom waves.
 - **Disco:** A portable dance floor!
@@ -100,6 +101,7 @@ Where `idProduct` can be found in these tables:
 
 | Year | Pro    | Regular + Slim | LOQ    |
 | ---- | ------ | -------------- | ------ |
+| 2025 |        |                | `c693` |
 | 2024 | `c995` | `c994`         | `c993` |
 | 2023 | `c985` | `c984`         | `c983` |
 
@@ -120,6 +122,44 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 Execute the file by double-clicking on it. You may pass extra startup options via the CLI by also specifying the `--gui` flag.
 
 Configuration for this mode is saved by default on the folder the program was executed in a file called `settings.json`, you can override this location by setting the `LEGION_KEYBOARD_CONFIG` environment variable.
+
+### Reverse-engineering mode (Windows)
+
+When comparing this app against Legion Space/Vantage behavior, you can enable extra HID logging:
+
+```powershell
+$env:LEGION_RGB_REVERSE_MODE = "1"
+```
+
+With this enabled, `legion_rgb_debug.log` will include:
+
+- Full Lenovo HID inventory snapshots (VID/PID, usage page, usage, interface, path)
+- Which interface/path was selected for raw LampArray and vendor HID
+- HID report descriptor previews for LampArray paths
+
+This makes it easier to line up your app's chosen interface/path with USBPcap/Wireshark captures while Legion Space is running.
+
+For LOQ 15IRX10 troubleshooting, you can also force vendor-interface-only writes:
+
+```powershell
+$env:LEGION_RGB_FORCE_VENDOR_ONLY = "1"
+```
+
+This disables MI_01 LampArray writes in the managed keepalive loop and only uses the MI_00 vendor endpoint (`usage_page 0xff89`, `usage 0x00cc`).
+
+LOQ 15IRX10 note: this model is driven through Windows Dynamic Lighting while the window is focused. Legion Space writes an overlay above the keyboard's built-in FN+Space profile; this app now saves your colors into that built-in profile so they stay after click-away. HID/vendor writes can open without changing the keys, so they are not used first.
+
+To try HID/vendor before Windows Dynamic Lighting:
+
+```powershell
+$env:LEGION_RGB_LOQ_HID_FIRST = "1"
+```
+
+To force mixed LampArray writes in the managed keepalive path:
+
+```powershell
+$env:LEGION_RGB_LOQ_USE_LAMPARRAY = "1"
+```
 
 ### Via the command line
 
@@ -155,6 +195,7 @@ This program has been tested to work on:
 
 - Legion 5 (Pro) 2020, 2021, 2022, 2023, 2024
 - Ideapad Gaming 3 2021, 2022, 2023, 2024
+- LOQ 15IRX10 (2025)
 
 ### "How about X model"
 

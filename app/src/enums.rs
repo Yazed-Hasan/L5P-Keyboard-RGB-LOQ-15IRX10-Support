@@ -27,6 +27,48 @@ pub enum Effects {
     Fade,
     Temperature,
     Ripple,
+    #[strum(serialize = "Audio React")]
+    AudioReact {
+        sensitivity: f32,
+        smoothness: f32,
+        min_brightness: u8,
+        bass: f32,
+        mid: f32,
+        treble: f32,
+        presence: f32,
+        #[serde(default = "default_audio_squelch")]
+        squelch: f32,
+        #[serde(default = "default_audio_punch")]
+        punch: f32,
+        color_mode: AudioColorMode,
+        style: AudioStyle,
+    },
+}
+
+fn default_audio_squelch() -> f32 {
+    0.07
+}
+
+fn default_audio_punch() -> f32 {
+    0.65
+}
+
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum AudioColorMode {
+    Profile,
+    #[default]
+    Spectrum,
+    Rainbow,
+}
+
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum AudioStyle {
+    #[default]
+    Levels,
+    Pulse,
+    Wave,
+    Bloom,
+    Center,
 }
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq)]
@@ -45,7 +87,19 @@ impl PartialEq for Effects {
 #[allow(dead_code)]
 impl Effects {
     pub fn takes_color_array(self) -> bool {
-        matches!(self, Self::Static | Self::Breath | Self::Lightning | Self::Swipe { .. } | Self::Fade | Self::Ripple)
+        matches!(
+            self,
+            Self::Static
+                | Self::Breath
+                | Self::Lightning
+                | Self::Swipe { .. }
+                | Self::Fade
+                | Self::Ripple
+                | Self::AudioReact {
+                    color_mode: AudioColorMode::Profile,
+                    ..
+                }
+        )
     }
 
     pub fn takes_direction(self) -> bool {
@@ -55,12 +109,36 @@ impl Effects {
     pub fn takes_speed(self) -> bool {
         matches!(
             self,
-            Self::Breath | Self::Smooth | Self::Wave | Self::Lightning | Self::SmoothWave { .. } | Self::Swipe { .. } | Self::Disco | Self::Fade | Self::Ripple
+            Self::Breath
+                | Self::Smooth
+                | Self::Wave
+                | Self::Lightning
+                | Self::SmoothWave { .. }
+                | Self::Swipe { .. }
+                | Self::Disco
+                | Self::Fade
+                | Self::Ripple
         )
     }
 
     pub fn is_built_in(self) -> bool {
         matches!(self, Self::Static | Self::Breath | Self::Smooth | Self::Wave)
+    }
+
+    pub fn audio_react_default() -> Self {
+        Self::AudioReact {
+            sensitivity: 1.2,
+            smoothness: 0.72,
+            min_brightness: 6,
+            bass: 1.0,
+            mid: 1.0,
+            treble: 1.0,
+            presence: 1.0,
+            squelch: 0.07,
+            punch: 0.65,
+            color_mode: AudioColorMode::Spectrum,
+            style: AudioStyle::Levels,
+        }
     }
 }
 

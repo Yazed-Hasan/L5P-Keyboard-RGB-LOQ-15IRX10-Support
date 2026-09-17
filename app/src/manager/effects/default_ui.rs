@@ -10,13 +10,20 @@ use crate::{
 
 const COMBOBOX_WIDTH: f32 = 20.0;
 
-pub fn show(ui: &mut Ui, profile: &mut Profile, update_lights: &mut bool, spacing: &SpacingStyle, is_dynamic_lighting: bool) {
+pub fn show(
+    ui: &mut Ui,
+    profile: &mut Profile,
+    update_lights: &mut bool,
+    spacing: &SpacingStyle,
+    is_dynamic_lighting: bool,
+    live_speed: &mut Option<u8>,
+) {
     ui.scope(|ui| {
         ui.style_mut().spacing.item_spacing = spacing.default;
 
         show_brightness(ui, profile, update_lights, is_dynamic_lighting);
         show_direction(ui, profile, update_lights);
-        show_effect_settings(ui, profile, update_lights);
+        show_effect_settings(ui, profile, update_lights, is_dynamic_lighting, live_speed);
     });
 }
 
@@ -59,11 +66,31 @@ pub fn show_direction(ui: &mut Ui, profile: &mut Profile, update_lights: &mut bo
     });
 }
 
-pub fn show_effect_settings(ui: &mut Ui, profile: &mut Profile, update_lights: &mut bool) {
-    let range = if profile.effect.is_built_in() { SPEED_RANGE } else { 1..=10 };
+pub fn show_effect_settings(
+    ui: &mut Ui,
+    profile: &mut Profile,
+    update_lights: &mut bool,
+    is_dynamic_lighting: bool,
+    live_speed: &mut Option<u8>,
+) {
+    // Firmware effects only accept 1..=4. Software/WDL effects use 1..=10.
+    let range = if is_dynamic_lighting || !profile.effect.is_built_in() {
+        1..=10
+    } else {
+        SPEED_RANGE
+    };
 
     ui.horizontal(|ui| {
-        *update_lights |= ui.add_enabled(profile.effect.takes_speed(), Slider::new(&mut profile.speed, range)).changed();
+        let changed = ui
+            .add_enabled(profile.effect.takes_speed(), Slider::new(&mut profile.speed, range))
+            .changed();
+        if changed {
+            if is_dynamic_lighting {
+                *live_speed = Some(profile.speed);
+            } else {
+                *update_lights = true;
+            }
+        }
         ui.label("Speed");
     });
 }

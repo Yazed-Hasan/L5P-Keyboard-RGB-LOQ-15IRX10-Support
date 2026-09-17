@@ -55,9 +55,12 @@ thiserror = "2.0.12"
 single-instance = "0.3.3"
 open = "5.3.2"
 error-stack = "0.5.0"
-winapi = { version = "0.3.9", features = ["consoleapi", "wincon", "processenv"] }
+winapi = { version = "0.3.9", features = ["consoleapi", "wincon", "processenv", "winuser", "processthreadsapi"] }
 
 # Tray icon
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.19"
+
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 tray-icon = { version = "0.20.1", default-features = false }
 

@@ -24,9 +24,7 @@ enum RippleMove {
 }
 
 pub fn play(manager: &mut Inner, p: &Profile) {
-    // Welcome to the definition of i-don't-know-what-im-doing
-    let stop_signals = manager.stop_signals.clone();
-
+    legion_rgb_driver::debug_log("EFFECT: ripple (direct zone paint)");
     let kill_thread = Arc::new(AtomicBool::new(false));
     let exit_thread = kill_thread.clone();
 
@@ -47,8 +45,6 @@ pub fn play(manager: &mut Inner, p: &Profile) {
         let tx_clone = tx.clone();
 
         let press_guard = event_handler.on_key_down(move |key| {
-            stop_signals.keyboard_stop_signal.store(true, Ordering::SeqCst);
-
             let _ = tx_clone.send(Event::KeyPress(*key));
         });
 
@@ -82,7 +78,6 @@ pub fn play(manager: &mut Inner, p: &Profile) {
                         }
                     }
 
-                    manager.stop_signals.keyboard_stop_signal.store(false, Ordering::SeqCst);
                 }
                 Event::KeyRelease(key) => {
                     for (i, zone) in KEY_ZONES.iter().enumerate() {
@@ -107,7 +102,10 @@ pub fn play(manager: &mut Inner, p: &Profile) {
             }
         }
 
-        let rgb_array = p.rgb_array();
+        let mut rgb_array = p.rgb_array();
+        if rgb_array.iter().all(|&c| c == 0) {
+            rgb_array = [255, 40, 80, 255, 160, 40, 40, 220, 120, 80, 120, 255];
+        }
         let mut final_arr: [u8; 12] = [0; 12];
 
         for (i, ripple_move) in zone_state.iter().enumerate() {
@@ -116,8 +114,9 @@ pub fn play(manager: &mut Inner, p: &Profile) {
             }
         }
 
-        manager.keyboard.transition_colors_to(&final_arr, 20, 0).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        manager.keyboard.set_colors_to(&final_arr).unwrap();
+        let step_ms = (80 / p.speed.max(1) as u64).clamp(16, 80);
+        thread::sleep(Duration::from_millis(step_ms));
     }
 
     kill_thread.store(true, Ordering::SeqCst);

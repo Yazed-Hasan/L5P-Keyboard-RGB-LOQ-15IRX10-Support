@@ -22,7 +22,7 @@ use tray_icon::menu::MenuEvent;
 use crate::{
     cli::OutputType,
     enums::Effects,
-    manager::{self, custom_effect::CustomEffect, profile::Profile, show_effect_ui, EffectManager, ManagerCreationError},
+    manager::{self, custom_effect::CustomEffect, profile::Profile, show_effect_ui, AudioReactParams, EffectManager, ManagerCreationError},
     persist::Settings,
     tray::{QUIT_ID, SHOW_ID},
     DENY_HIDING,
@@ -212,8 +212,55 @@ impl App {
     }
 }
 
+fn os_process_is_foreground() -> bool {
+    let (our_pid, fg_pid) = foreground_pids();
+    fg_pid == 0 || fg_pid == our_pid
+}
+
+fn foreground_pids() -> (u32, u32) {
+    #[cfg(windows)]
+    unsafe {
+        use winapi::um::processthreadsapi::GetCurrentProcessId;
+        use winapi::um::winuser::{GetForegroundWindow, GetWindowThreadProcessId};
+        let our_pid = GetCurrentProcessId();
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return (our_pid, 0);
+        }
+        let mut fg_pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut fg_pid);
+        (our_pid, fg_pid)
+    }
+    #[cfg(not(windows))]
+    {
+        (0, 0)
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(manager) = &self.manager {
+            // egui viewport.focused flaps when popups/color pickers open, which made
+            // lighting drop and restore every couple of seconds. OS foreground PID is stable.
+            let window_active = os_process_is_foreground()
+                || ctx.input(|i| {
+                    i.viewport().focused.unwrap_or(false)
+                        || i.pointer.hover_pos().is_some()
+                        || i.pointer.any_down()
+                });
+            static LAST_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            let prev = LAST_ACTIVE.swap(window_active, Ordering::Relaxed);
+            if prev != window_active {
+                let (our_pid, fg_pid) = foreground_pids();
+                let viewport = ctx.input(|i| i.viewport().focused);
+                legion_rgb_driver::debug_log(&format!(
+                    "GUI: window_active {} -> {} our_pid={} fg_pid={} viewport={:?}",
+                    prev, window_active, our_pid, fg_pid, viewport
+                ));
+            }
+            manager.window_active.store(window_active, Ordering::Relaxed);
+        }
+
         if let Ok(message) = self.gui_rx.try_recv() {
             match message {
                 GuiMessage::CycleProfiles => self.cycle_profiles(),
@@ -371,6 +418,10 @@ impl App {
                     ScrollArea::vertical().show(ui, |ui| {
                         ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
                             for val in Effects::iter() {
+                                let val = match val {
+                                    Effects::AudioReact { .. } => Effects::audio_react_default(),
+                                    other => other,
+                                };
                                 let text: &'static str = val.into();
                                 if ui.selectable_value(&mut self.current_profile.effect, val, text).clicked() {
                                     self.state_changed = true;
@@ -386,7 +437,25 @@ impl App {
 
     fn show_effect_ui(&mut self, ui: &mut eframe::egui::Ui) {
         ui.add_enabled_ui(self.loaded_effect.is_none(), |ui| {
-            show_effect_ui(ui, &mut self.current_profile, &mut self.state_changed, &self.theme, self.is_dynamic_lighting);
+            let mut live_speed = None;
+            show_effect_ui(
+                ui,
+                &mut self.current_profile,
+                &mut self.state_changed,
+                &self.theme,
+                self.is_dynamic_lighting,
+                &mut live_speed,
+            );
+            if let Some(speed) = live_speed {
+                if let Some(manager) = &self.manager {
+                    manager.set_live_speed(speed);
+                }
+            }
+            if matches!(self.current_profile.effect, crate::enums::Effects::AudioReact { .. }) {
+                if let Some(manager) = &self.manager {
+                    manager.set_live_audio(AudioReactParams::from_effect(self.current_profile.effect));
+                }
+            }
         });
     }
 

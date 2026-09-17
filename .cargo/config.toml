@@ -1,0 +1,2 @@
+[env]
+VCPKG_ROOT = { value = "target/vcpkg_repo", relative = true }
