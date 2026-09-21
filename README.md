@@ -38,9 +38,27 @@
 
 **⚠️ Use at your own risk, the developer is not responsible for any damages that may arise as a result of using this program.**
 
+**⚠️LOQ 15IRX10 PLZ if its not working just toggle windows dynamic lights on/off from the settings then lunch it again and make sure legion space is closed**
+
+
+
+
 Builds will be periodically uploaded to the [releases tab](https://github.com/4JX/L5P-Keyboard-RGB/releases).
 
 You may also download pre-compiled versions from [here](https://github.com/4JX/L5P-Keyboard-RGB/actions/workflows/release-rust.yml) (requires github account) by clicking the latest entry with a ✅ and going under the "artifacts" section.
+
+
+LOQ 15IRX10 EG thx bro for the video:
+
+
+https://github.com/user-attachments/assets/a09962e2-3b82-4fd9-9e73-4aed728b06d7
+
+
+
+
+
+
+
 
 ## Available effects
 
