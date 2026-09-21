@@ -16,12 +16,6 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: linux
-            os: ubuntu-latest
-            artifact_name: target/debug/legion-kb-rgb
-            asset_name: legion-kb-rgb-linux
-            triplet: x64-linux
-            vcpkgCommitId: '9e593bb18ea69cc5095e012465dcd675a822ed0d'
           - name: windows
             os: windows-latest
             artifact_name: target/debug/legion-kb-rgb.exe
