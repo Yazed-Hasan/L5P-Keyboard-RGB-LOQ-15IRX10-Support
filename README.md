@@ -43,7 +43,7 @@
 
 
 
-Builds will be periodically uploaded to the [releases tab](https://github.com/4JX/L5P-Keyboard-RGB/releases).
+Builds will be periodically uploaded to the [releases tab](https://github.com/Yazed-Hasan/L5P-Keyboard-RGB-LOQ-15IRX10-Support/releases).
 
 You may also download pre-compiled versions from [here](https://github.com/4JX/L5P-Keyboard-RGB/actions/workflows/release-rust.yml) (requires github account) by clicking the latest entry with a ✅ and going under the "artifacts" section.
 
