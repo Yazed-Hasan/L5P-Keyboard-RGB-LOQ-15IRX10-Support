@@ -129,7 +129,7 @@ Do not run this next to Legion Space, Vantage lighting, or another RGB tool. The
 The LOQ 15IRX10 has **24 lamp strips**.
 
 - **24-lamp mode off (default):** treats the keyboard as 4 zones. Lighter on CPU, closer to classic Legion RGB.
-- **24-lamp mode on:** paints all 24 strips, like Legion Space custom themes. Waves, rain, aurora, and scanner look much better here.
+- **24-lamp mode on:** paints all **24 columns** left to right. This keyboard has no independent rows. Waves, rain, aurora, scanner, and the new motion effects look much better here.
 
 Turn it on with the **24-lamp mode** checkbox at the top of the window.
 
@@ -151,19 +151,47 @@ Pick an effect on the right. Colors, speed, and extra sliders sit on the left. *
 - **Lightning:** random sparks.
 - **Disco:** random zone flashes.
 - **Christmas:** red / green holiday pulse.
-- **Ripple:** rings or waves from a point. Width, origin, and style are adjustable. In 24-lamp mode the ring hops strip by strip.
+- **Ripple:** rings or waves from a point. Width, origin, and style are adjustable. In 24-lamp mode the ring hops column by column.
 - **Stars:** twinkling night sky, optional shooting stars. Palettes: Custom, White, Gold, Rainbow, Random.
 - **Rain:** drops with trails, splash, and wind. Palettes: Ice, Neon, Rainbow, Custom.
 - **Aurora:** overlapping northern-light bands. **Borealis** is green-cyan, **Twilight** is purple, **Custom** uses your zone colors.
-- **Scanner:** a moving beam with trail. Bounce or wrap, optional second beam. Palettes: Red, Ice, Rainbow, Custom.
+- **Scanner:** a short bouncing hotspot with a trail. Bounce or wrap, optional second beam. Palettes: Red, Ice, Rainbow, Custom.
+- **Pacifica:** layered blue-green ocean sines. Not raindrops and not aurora bands.
+- **Digital Rain:** heads travel across the keyboard with a fading trail (Matrix-style). Uses all 24 columns in 24-lamp mode.
+- **Fireworks:** random bursts that pop and fade. No audio needed.
+- **Comet:** a meteor with a fat head and a long tail. Wrap flies off the edge; Bounce turns around. Not the short Scanner beam.
+- **Juggle:** several colored dots weave back and forth with trails. Not a single Scanner beam and not a Comet.
+- **Bouncing Balls:** balls fall with gravity and bounce at the ends.
+- **Dissolve:** keys fill in a random order, pause, then melt away. Best in 24-lamp mode.
 
 ### Reactive
 
 - **AmbientLight:** samples the screen and copies those colors onto the keyboard. FPS and saturation are adjustable.
-- **Audio React:** listens to Windows playback (WASAPI loopback). Sensitivity, smoothness, idle glow, per-band gain, color mode, and style (levels, pulse, wave, fire, ripple, and more).
+- **Audio React:** listens to Windows playback (WASAPI loopback). See below.
 - **Battery:** charge bar across the keys. Traffic palette is green / yellow / red. Pulses at the tip while charging.
 - **Temperature:** cool-to-hot gradient from CPU temperature. Needs a readable sensor; on some Windows setups it may stay still.
 - **Fade:** dims the keyboard after you stop typing / moving the mouse.
+- **Type Heat:** zones heat up as you type and cool when idle. Not a spreading wave like Ripple.
+- **Nexus:** a pulse on the keys you press (that quarter of columns, with a little bleed). Not a spreading ring like Ripple.
+
+### Audio React
+
+Windows loopback only (the sound this PC is playing). Hover each slider in the app for details.
+
+**Analysis** (how it hears the mix):
+
+- **Auto:** picks among the engines below as the mix changes. Lighting Style stays what you chose.
+- **Classic:** original 4-band analyzer.
+- **Accurate:** tighter kicks and a cleaner spectrum than Classic.
+- **Beats:** biased to kicks and onsets. Best with Ripple, Strobe, Collision, Tempo Pulse.
+- **Spectrum:** truthful EQ. Best with Levels, 24-band EQ, Spectrogram.
+- **Mel:** 24 perceptual bins. Better bass/vocal spacing.
+- **Studio:** larger FFT, clearer low notes, a bit heavier.
+- **HPSS:** drums vs pads. Beats follow percussion so vocals false-trigger less.
+- **Complex:** specdiff + phase onsets. Cleaner hits on mixed music.
+- **Tempo:** stabler BPM lock.
+
+**Styles** (how it paints): Levels, Pulse, Wave, Bloom, Center, Mirror, Fire, Strobe, Sparkle, Chase, Gradient, Beat Gates, VU, Tempo Pulse, Oscilloscope, Spectrogram, Stereo, Pitch, Lissajous, Bubbles, Key Color, Mid/Side, 24-band EQ, Pan Needle, Collision, Snake, Ripple, Gravcenter, Melt, Wavelength.
 
 ### Custom JSON effects
 
