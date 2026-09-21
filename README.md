@@ -1,88 +1,173 @@
 <img height="100" align="left" src="./app/res/trayIcon.svg" alt="logo">
 
-# Legion RGB Control <!-- omit in toc -->
+# Legion RGB Control for LOQ 15IRX10 <!-- omit in toc -->
 
-[![Latest Version](https://img.shields.io/github/v/tag/4JX/L5P-Keyboard-RGB?style=for-the-badge&label=Download+Latest)](https://github.com/4JX/L5P-Keyboard-RGB/releases)
-![Build Status](https://img.shields.io/github/actions/workflow/status/4JX/L5P-Keyboard-RGB/release-rust.yml?style=for-the-badge)
-[![Support Server](https://img.shields.io/discord/819491422327406592?style=for-the-badge)](https://discord.gg/rQEQzsyPe8)
+[![Latest Version](https://img.shields.io/github/v/tag/Yazed-Hasan/L5P-Keyboard-RGB-LOQ-15IRX10-Support?style=for-the-badge&label=Download+Latest)](https://github.com/Yazed-Hasan/L5P-Keyboard-RGB-LOQ-15IRX10-Support/releases)
+![Build Status](https://img.shields.io/github/actions/workflow/status/Yazed-Hasan/L5P-Keyboard-RGB-LOQ-15IRX10-Support/release-rust.yml?style=for-the-badge)
+[![Repository](https://img.shields.io/badge/GitHub-Yazed--Hasan-blue?style=for-the-badge)](https://github.com/Yazed-Hasan/L5P-Keyboard-RGB-LOQ-15IRX10-Support)
 
 <div align="center">
-<img style="max-width: 500px; width: 100%;" src="./Preview.png" alt="logo">
+<img style="max-width: 500px; width: 100%;" src="./Preview.png" alt="App preview">
 
-<a href="https://www.buymeacoffee.com/4JXdev"><img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=☕&slug=4JXdev&button_colour=FFDD00&font_colour=000000&font_family=Poppins&outline_colour=000000&coffee_colour=ffffff" style="width: 200px"/></a>
-[![Donate](https://liberapay.com/assets/widgets/donate.svg)](https://liberapay.com/4JX/donate)
+Keyboard RGB control for the **Lenovo LOQ 15IRX10 (2025)**. Maintained by [Yazed Hasan](https://github.com/Yazed-Hasan). Forked from [4JX/L5P-Keyboard-RGB](https://github.com/4JX/L5P-Keyboard-RGB).
+
+**These changes exist only to support the LOQ 15IRX10.** Other Legion / LOQ / Ideapad models are **not tested here**. If you have a different laptop, use the [original 4JX app](https://github.com/4JX/L5P-Keyboard-RGB) instead. I do not know if this fork still works on those machines.
 
 </div>
 
 ## Index <!-- omit in toc -->
 
 - [Download](#download)
-- [Available effects](#available-effects)
-  - [Creating your own effects](#creating-your-own-effects)
-    - [At a glance](#at-a-glance)
-    - [File sections](#file-sections)
+- [How it works on the LOQ 15IRX10](#how-it-works-on-the-loq-15irx10)
+- [How it talks to the hardware](#how-it-talks-to-the-hardware)
+- [If the lights do not change](#if-the-lights-do-not-change)
+- [4-zone vs 24-lamp mode](#4-zone-vs-24-lamp-mode)
+- [Effects](#effects)
 - [Usage](#usage)
-  - [Format](#format)
-  - [With GUI](#with-gui)
-  - [Via the command line](#via-the-command-line)
-- [Compatibility](#compatibility)
-  - ["How about X model"](#how-about-x-model)
+- [Other models](#other-models)
 - [Building from source](#building-from-source)
-  - [Prerequisites](#prerequisites)
-    - [Linux (Ubuntu)](#linux-ubuntu)
-  - [Using `cargo-make`](#using-cargo-make)
-  - [Building manually](#building-manually)
 - [Crashes, freezes, etc](#crashes-freezes-etc)
 
 ## Download
 
-**⚠️ Use at your own risk, the developer is not responsible for any damages that may arise as a result of using this program.**
+**Use at your own risk. The developer is not responsible for any damage.**
 
-**⚠️LOQ 15IRX10 PLZ if its not working just toggle windows dynamic lights on/off from the settings then lunch it again and make sure legion space is closed**
+This build is for the **LOQ 15IRX10 only**. I have not tested other keyboards.
 
+Windows builds are uploaded to the [releases tab](https://github.com/Yazed-Hasan/L5P-Keyboard-RGB-LOQ-15IRX10-Support/releases). You can also grab the latest CI artifact from [Actions](https://github.com/Yazed-Hasan/L5P-Keyboard-RGB-LOQ-15IRX10-Support/actions/workflows/release-rust.yml) (GitHub account required): open the latest green run and download it from **Artifacts**.
 
-
-
-Builds will be periodically uploaded to the [releases tab](https://github.com/Yazed-Hasan/L5P-Keyboard-RGB-LOQ-15IRX10-Support/releases).
-
-You may also download pre-compiled versions from [here](https://github.com/4JX/L5P-Keyboard-RGB/actions/workflows/release-rust.yml) (requires github account) by clicking the latest entry with a ✅ and going under the "artifacts" section.
-
-
-LOQ 15IRX10 EG thx bro for the video:
-
+LOQ 15IRX10 demo:
 
 https://github.com/user-attachments/assets/a09962e2-3b82-4fd9-9e73-4aed728b06d7
 
+## How it works on the LOQ 15IRX10
 
+This laptop is **not** driven like older Legion 4-zone boards.
 
+The keyboard is USB `048d:c693` (ITE / Lenovo). Windows owns it through **Windows Dynamic Lighting**. Legion Space is only an overlay on top. The keys also have a built-in FN+Space profile.
 
+Close **Legion Space** before you start. Leave **Windows Dynamic Lighting** enabled.
 
+Settings are saved next to the exe as `settings.json`. You can point that file somewhere else with the `LEGION_KEYBOARD_CONFIG` environment variable.
 
+## How it talks to the hardware
 
+This protocol write-up is for the **LOQ 15IRX10 only**. I have not checked other laptops.
 
-## Available effects
+The 15IRX10 keyboard exposes **two HID interfaces** on the same USB device:
 
-**All stock effects:** Static, Breath, Smooth, LeftWave, RightWave.
+| Interface | HID usage | What it is | What actually happens |
+| --------- | --------- | ---------- | --------------------- |
+| LampArray (Windows Dynamic Lighting) | page `0x0059`, usage `0x0001` | Standard Microsoft lighting API, **24 lamps** | This is the path that **visibly changes the keys** |
+| Vendor (Lenovo) | page `0xff89`, usage `0x00cc` (usually MI_00) | Old Legion packet protocol (`0xCC` / `0x16` style, plus Gen7 profile commands like `0xCB` save) | Can open without lighting the board. Not used first |
 
-**Custom effects:**
+### What the app does on start
 
-- **Lightning:** Adds a little _spark_.
-- **AmbientLight:** Reacts to content on your screen.
-- **Audio React:** Reacts to system playback (WASAPI loopback) with sensitivity, smoothness, idle glow, per-band gain, color mode, and style.
-- **Smooth(Left/Right)Wave:** An implementation of the classic wave effect.
-- **(Left/Right)Swipe:** Transitions the selected colors from side to side, useful for custom waves.
-- **Disco:** A portable dance floor!
-- **Christmas:** Even keyboards can get festive.
-- **Fade:** Turns off the keyboard lights after a period of inactivity.
-- **Temperature:** Displays a gradient based on the current CPU temperature. (Linux only)
+When it sees PID `c693` it uses a dedicated LOQ path:
 
-### Creating your own effects
+1. **Windows Dynamic Lighting (WinRT)** — `LampArray.FromIdAsync` on `VID_048D` / `PID_C693`. This is the default because it is the only API that reliably updates this keyboard.
+2. **Raw HID LampArray** — open usage page `0x0059` ourselves, take host control, paint 24 lamps. Fallback only.
+3. **Vendor HID** — open `0xff89` / `0x00cc` and send legacy packets. Last resort. HID-first can succeed and still leave the keys dark.
 
-The best way to add a new effect is to directly edit the source code, as it allows the most flexibility. You can however also use the built-in feature to make basic effects.
+HID/vendor is tried first only if you set `LEGION_RGB_LOQ_HID_FIRST=1`.
 
-#### At a glance
+It also stops Legion lighting helpers and writes `HKCU\Software\Microsoft\Lighting` so Legion Space is not sitting above this app.
 
-- You can make custom effects using a `json` file with the following format:
+### While the window is focused
+
+Effects are **software frames**, not firmware effects.
+
+```
+GUI / effect thread
+        │  4 zone colors  or  24 lamp RGB
+        ▼
+driver keepalive
+        │
+        ▼
+Windows Dynamic Lighting (WinRT LampArray)
+        │  24 lamp strips
+        ▼
+keyboard LEDs
+```
+
+- **4-zone mode** expands four `[R,G,B]` groups across the 24 strips.
+- **24-lamp mode** sends a color per strip, like Legion Space custom themes.
+- Brightness is 1–100% (Windows scale), not the old Legion 1/2 levels.
+- A keepalive thread keeps pushing the last frame so Windows does not snap the lights back.
+
+Older Legion 5 boards send a firmware effect ID (Static, Breath, Wave) over the vendor endpoint. This LOQ does not. Breath, wave, rain, aurora, audio, and the rest are all computed in the app, then painted as Static RGB.
+
+### After you click away
+
+WinRT LampArray is **focus-gated**. When another window is in front, Windows takes the keyboard back.
+
+The app then hands the last colors to **Windows hold lighting** (`HKCU\Software\Microsoft\Lighting`: `Color`, `Color2`, `Brightness`, `EffectType`). Windows keeps a solid or simple gradient on the keys.
+
+Vendor `SAVE_PROFILE` (`0xCB`) is **off by default**. Saving into firmware while WinRT still owns the LampArray made the keys flicker. Windows hold lighting is the unfocused path instead.
+
+That is why you should:
+
+- keep Dynamic Lighting **on**
+- close Legion Space
+- focus the app once so it can take the LampArray
+
+### Why HID alone is not enough
+
+Opening the vendor or LampArray HID handle on this model often returns success. The packets go out. The LEDs do not move. Windows already has exclusive access to the LampArray interface, so the app talks to Windows, and Windows talks to the hardware.
+
+## If the lights do not change
+
+1. Fully close Legion Space (tray icon too).
+2. Open Windows Settings → Personalization → Dynamic Lighting. Toggle it **off**, then **on**.
+3. Launch this app again and keep the window focused once so it can take control.
+4. If it is still stuck, reboot, then repeat the toggle before opening the app.
+
+Do not run this next to Legion Space, Vantage lighting, or another RGB tool. They will fight over the same keyboard.
+
+## 4-zone vs 24-lamp mode
+
+The LOQ 15IRX10 has **24 lamp strips**.
+
+- **24-lamp mode off (default):** treats the keyboard as 4 zones. Lighter on CPU, closer to classic Legion RGB.
+- **24-lamp mode on:** paints all 24 strips, like Legion Space custom themes. Waves, rain, aurora, and scanner look much better here.
+
+Turn it on with the **24-lamp mode** checkbox at the top of the window.
+
+## Effects
+
+Pick an effect on the right. Colors, speed, and extra sliders sit on the left. **Reset this mode** only restores the effect you are looking at.
+
+### Solid and stock
+
+- **Static:** four zone colors, no motion.
+- **Breath:** fades the current colors in and out.
+- **Smooth:** cycles through a rainbow.
+- **Wave:** built-in left/right wave.
+
+### Motion
+
+- **SmoothWave:** software wave across the keys. **Change** swaps colors as it moves. **Fill** paints the board, then clears it. **Clean with black** fades through black between fills.
+- **Swipe:** same idea as SmoothWave, more of a hard wipe.
+- **Lightning:** random sparks.
+- **Disco:** random zone flashes.
+- **Christmas:** red / green holiday pulse.
+- **Ripple:** rings or waves from a point. Width, origin, and style are adjustable. In 24-lamp mode the ring hops strip by strip.
+- **Stars:** twinkling night sky, optional shooting stars. Palettes: Custom, White, Gold, Rainbow, Random.
+- **Rain:** drops with trails, splash, and wind. Palettes: Ice, Neon, Rainbow, Custom.
+- **Aurora:** overlapping northern-light bands. **Borealis** is green-cyan, **Twilight** is purple, **Custom** uses your zone colors.
+- **Scanner:** a moving beam with trail. Bounce or wrap, optional second beam. Palettes: Red, Ice, Rainbow, Custom.
+
+### Reactive
+
+- **AmbientLight:** samples the screen and copies those colors onto the keyboard. FPS and saturation are adjustable.
+- **Audio React:** listens to Windows playback (WASAPI loopback). Sensitivity, smoothness, idle glow, per-band gain, color mode, and style (levels, pulse, wave, fire, ripple, and more).
+- **Battery:** charge bar across the keys. Traffic palette is green / yellow / red. Pulses at the tip while charging.
+- **Temperature:** cool-to-hot gradient from CPU temperature. Needs a readable sensor; on some Windows setups it may stay still.
+- **Fade:** dims the keyboard after you stop typing / moving the mouse.
+
+### Custom JSON effects
+
+You can also load a `json` file of steps:
 
 ```json
 {
@@ -94,208 +179,83 @@ The best way to add a new effect is to directly edit the source code, as it allo
 }
 ```
 
-#### File sections
-
-- **effect_steps:** Contains the different _"steps"_ the effect will go through.
-  - **rgb_array:** An array describing the colours to use in the `[r,g,b,r,g,b...]` format.
-  - **step_type:** The type of step to use. You may instantly swap the colours with `Set` or smoothly transition to them with `Transition`.
-  - **brightness:** The brightness of the step, can be `1` (low) or `2` (high).
-  - **steps:** To smoothly transition between colours, the keyboard LEDs are set at small intervals until they reach the desired color. This controls the number of them.
-  - **delay_between_steps:** How much time to wait between each interval (In ms).
-  - **sleep:** The time to wait before going to the next `effect_step` (In ms).
-- **should_loop:** Whether the effect should start again once it reaches the last step.
+- **rgb_array:** `[r,g,b,r,g,b,r,g,b,r,g,b]` for the four zones.
+- **step_type:** `Set` jumps, `Transition` blends.
+- **brightness:** `1` low, `2` high.
+- **steps / delay_between_steps / sleep:** how fine the blend is, wait between intervals, and wait before the next step (ms).
+- **should_loop:** start over at the end.
 
 ## Usage
 
-**Note**: By default, on Linux you will have to run the program with root privileges, however, you can remedy this by adding the following `udev` rule (in a path similar to `/etc/udev/rules.d/99-kblight.rules`):
-
-### Format
-
-```sh
-SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="####", MODE="0666"
-```
-
-Where `idProduct` can be found in these tables:
-
-| Year | Pro    | Regular + Slim | LOQ    |
-| ---- | ------ | -------------- | ------ |
-| 2025 |        |                | `c693` |
-| 2024 | `c995` | `c994`         | `c993` |
-| 2023 | `c985` | `c984`         | `c983` |
-
-| Year | Pro + Regular + Slim | Ideapad |
-| ---- | -------------------- | ------- |
-| 2022 | `c975`               | `c973`  |
-| 2021 | `c965`               | `c963`  |
-| 2020 | `c955`               |         |
-
-And then reloading the rules:
-
-```sh
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
-
-### With GUI
-
-Execute the file by double-clicking on it. You may pass extra startup options via the CLI by also specifying the `--gui` flag.
-
-Configuration for this mode is saved by default on the folder the program was executed in a file called `settings.json`, you can override this location by setting the `LEGION_KEYBOARD_CONFIG` environment variable.
-
-### Reverse-engineering mode (Windows)
-
-When comparing this app against Legion Space/Vantage behavior, you can enable extra HID logging:
-
-```powershell
-$env:LEGION_RGB_REVERSE_MODE = "1"
-```
-
-With this enabled, `legion_rgb_debug.log` will include:
-
-- Full Lenovo HID inventory snapshots (VID/PID, usage page, usage, interface, path)
-- Which interface/path was selected for raw LampArray and vendor HID
-- HID report descriptor previews for LampArray paths
-
-This makes it easier to line up your app's chosen interface/path with USBPcap/Wireshark captures while Legion Space is running.
-
-For LOQ 15IRX10 troubleshooting, you can also force vendor-interface-only writes:
-
-```powershell
-$env:LEGION_RGB_FORCE_VENDOR_ONLY = "1"
-```
-
-This disables MI_01 LampArray writes in the managed keepalive loop and only uses the MI_00 vendor endpoint (`usage_page 0xff89`, `usage 0x00cc`).
-
-LOQ 15IRX10 note: this model is driven through Windows Dynamic Lighting while the window is focused. Legion Space writes an overlay above the keyboard's built-in FN+Space profile; this app now saves your colors into that built-in profile so they stay after click-away. HID/vendor writes can open without changing the keys, so they are not used first.
-
-To try HID/vendor before Windows Dynamic Lighting:
-
-```powershell
-$env:LEGION_RGB_LOQ_HID_FIRST = "1"
-```
-
-To force mixed LampArray writes in the managed keepalive path:
-
-```powershell
-$env:LEGION_RGB_LOQ_USE_LAMPARRAY = "1"
-```
-
-### Via the command line
-
-Usage:
-
-```sh
-legion-kb-rgb [OPTIONS] [SUBCOMMAND]
-```
-
-Examples:
-
-- Getting the help prompt
+Double-click the exe. For CLI extras plus the window, pass `--gui`.
 
 ```sh
 legion-kb-rgb --help
-```
-
-- Setting the keyboard to red
-
-```sh
 legion-kb-rgb set -e Static -c 255,0,0,255,0,0,255,0,0,255,0,0
-```
-
-- Using the SmoothWave effect going to the left with speed `4` and brightness at high
-
-```sh
 legion-kb-rgb set -e SmoothWave -s 4 -b 2 -d Left
 ```
 
-## Compatibility
+### Advanced Windows flags
 
-This program has been tested to work on:
+Only if you are comparing this app to Legion Space or USB captures:
 
-- Legion 5 (Pro) 2020, 2021, 2022, 2023, 2024
-- Ideapad Gaming 3 2021, 2022, 2023, 2024
-- LOQ 15IRX10 (2025)
+```powershell
+$env:LEGION_RGB_REVERSE_MODE = "1"       # extra HID logging in legion_rgb_debug.log
+$env:LEGION_RGB_LOQ_HID_FIRST = "1"      # try HID/vendor before Windows Dynamic Lighting
+$env:LEGION_RGB_LOQ_USE_LAMPARRAY = "1"  # mixed LampArray writes in the keepalive path
+$env:LEGION_RGB_FORCE_VENDOR_ONLY = "1"  # vendor endpoint only (MI_00, usage 0xff89/0x00cc)
+```
 
-### "How about X model"
+On the 15IRX10, HID-first can open the device and still leave the keys dark. Leave these unset unless you are debugging.
 
-- **Legion 7(i):** Won't work, the backlight on these is per-key and uses a different way of communicating.
-- **Any variant with a white backlight:** Haven't figured out how to talk to this one yet, but given the limited number of states (off, low, high) there's not many effects I'd be able to add anyways.
+## Other models
+
+**This fork is only for the LOQ 15IRX10 (`048d:c693`).** The Windows Dynamic Lighting path, 24-lamp mode, hold-lighting handoff, and Legion Space workarounds were added for that machine. I do not know what they do on other laptops.
+
+For Legion 5, Ideapad Gaming 3, older LOQ, and anything else, use [4JX/L5P-Keyboard-RGB](https://github.com/4JX/L5P-Keyboard-RGB). That project is the one that actually supports those boards.
+
+- **This repo:** LOQ 15IRX10 (2025), Windows. Tested by me.
+- **Anything else:** untested here. No idea if it works, breaks, or does nothing.
+
+USB IDs below are from the original project, for reference only. They are **not** a compatibility list for this fork.
+
+| Year | Pro    | Regular + Slim | LOQ    |
+| ---- | ------ | -------------- | ------ |
+| 2025 |        |                | `c693` (this fork) |
+| 2024 | `c995` | `c994`         | `c993` |
+| 2023 | `c985` | `c984`         | `c983` |
+| 2022 | `c975` | `c973`         |        |
+| 2021 | `c965` | `c963`         |        |
+| 2020 | `c955` |                |        |
 
 ## Building from source
 
-### Prerequisites
+Windows is the target for LOQ 15IRX10.
 
 - [Rust](https://www.rust-lang.org/tools/install)
 - [Git](https://git-scm.com/downloads)
+- [VCPKG](https://github.com/Microsoft/vcpkg#getting-started) with `VCPKG_ROOT` set
 
-#### Linux (Ubuntu)
-
-```sh
-sudo apt-get install -y libclang-dev libxcb-shm0-dev libusb-1.0-0-dev libx11-dev nasm libdbus-1-dev libudev-dev libxcb-randr0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libxi-dev libxtst-dev libpango1.0-dev libgtk-3-dev libxdo-dev libappindicator3-dev
+```cmd
+vcpkg update && vcpkg install libvpx:x64-windows-static libyuv:x64-windows-static aom:x64-windows-static
+git clone https://github.com/Yazed-Hasan/L5P-Keyboard-RGB-LOQ-15IRX10-Support.git
+cd L5P-Keyboard-RGB-LOQ-15IRX10-Support
+cargo build --release
 ```
 
-<!-- #### Windows -->
-
-<!-- Follow [this guide](https://gtk-rs.org/gtk4-rs/stable/latest/book/installation_windows.html#pkg-config) but build GTK3 instead of GTK4. -->
-
-### Using `cargo-make`
-
-Works on both Windows and Linux.
-
-- Install `cargo-make`
+Or with `cargo-make`:
 
 ```sh
 cargo install cargo-make
-```
-
-- Clone the repository
-
-```sh
-git clone https://github.com/4JX/L5P-Keyboard-RGB.git
-```
-
-- Build the project
-
-```sh
-cd L5P-Keyboard-RGB/
 cargo make build-release
-```
-
-### Building manually
-
-- Download and bootstrap [VCPKG](https://github.com/Microsoft/vcpkg#getting-started)
-- You'll need to set an environment variable called `VCPKG_ROOT` pointing to the directory where you downloaded and bootstrapped VCPKG.
-
-- Download the VCPKG dependencies
-
-Windows:
-
-```cmd
-vcpkg update && vcpkg install libvpx:x64-windows-static libyuv:x64-windows-static
-```
-
-Linux:
-
-```sh
-vcpkg update && vcpkg install libvpx libyuv
-```
-
-- Clone the repository
-
-```sh
-git clone https://github.com/4JX/L5P-Keyboard-RGB.git
-```
-
-- Build the project
-
-```sh
-cd L5P-Keyboard-RGB/
-cargo build --release
 ```
 
 ## Crashes, freezes, etc
 
-I cannot guarantee this solution will work for anyone but myself. That being said feel free to open an issue if you encounter any of these problems on the [issues tab](https://github.com/4JX/L5P-Keyboard-RGB/issues).
+No guarantees. This was tested on a LOQ 15IRX10. Open an issue on the [issues tab](https://github.com/Yazed-Hasan/L5P-Keyboard-RGB-LOQ-15IRX10-Support/issues) if that model breaks. For other models, please use the [original repo](https://github.com/4JX/L5P-Keyboard-RGB).
 
 ---
 
-Thanks to legendk95#0574 (272711294338072577) over at discord for initially reverse engineering the way to talk to the keyboard.
+Maintained by [Yazed Hasan](https://github.com/Yazed-Hasan) for the **LOQ 15IRX10 only**. Based on [4JX/L5P-Keyboard-RGB](https://github.com/4JX/L5P-Keyboard-RGB). Other models are not tested.
+
+Thanks to legendk95#0574 (272711294338072577) on Discord for the original keyboard reverse engineering.
