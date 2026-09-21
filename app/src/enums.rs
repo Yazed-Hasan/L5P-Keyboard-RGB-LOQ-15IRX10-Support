@@ -82,6 +82,8 @@ pub enum Effects {
         ripple_shock_sensitivity: f32,
         color_mode: AudioColorMode,
         style: AudioStyle,
+        #[serde(default)]
+        analysis: AudioAnalysis,
     },
     Stars {
         #[serde(default)]
@@ -102,6 +104,45 @@ pub enum Effects {
     Battery {
         #[serde(default)]
         params: BatteryParams,
+    },
+    #[strum(serialize = "Type Heat")]
+    TypeHeat {
+        #[serde(default)]
+        params: TypeHeatParams,
+    },
+    Pacifica {
+        #[serde(default)]
+        params: PacificaParams,
+    },
+    #[strum(serialize = "Digital Rain")]
+    DigitalRain {
+        #[serde(default)]
+        params: DigitalRainParams,
+    },
+    Fireworks {
+        #[serde(default)]
+        params: FireworksParams,
+    },
+    Nexus {
+        #[serde(default)]
+        params: NexusParams,
+    },
+    Comet {
+        #[serde(default)]
+        params: CometParams,
+    },
+    Juggle {
+        #[serde(default)]
+        params: JuggleParams,
+    },
+    #[strum(serialize = "Bouncing Balls")]
+    Bounce {
+        #[serde(default)]
+        params: BounceParams,
+    },
+    Dissolve {
+        #[serde(default)]
+        params: DissolveParams,
     },
 }
 
@@ -155,6 +196,42 @@ fn default_ripple_shock_sensitivity() -> f32 {
 
 fn default_ripple_rgb() -> [u8; 3] {
     [255, 48, 96]
+}
+
+fn default_comet_head() -> f32 {
+    1.0
+}
+
+fn default_comet_glow() -> f32 {
+    0.22
+}
+
+fn default_comet_fade() -> f32 {
+    1.25
+}
+
+fn default_comet_wobble() -> f32 {
+    0.35
+}
+
+fn default_comet_hue_speed() -> f32 {
+    1.0
+}
+
+fn default_comet_sparkle() -> f32 {
+    0.0
+}
+
+fn default_comet_saturation() -> f32 {
+    1.0
+}
+
+fn default_comet_gap() -> f32 {
+    0.46
+}
+
+fn default_comet_follow() -> f32 {
+    0.62
 }
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
@@ -228,7 +305,37 @@ pub enum AudioStyle {
     BeatGates,
     Vu,
     TempoPulse,
+    Oscilloscope,
+    Spectrogram,
+    Stereo,
+    Pitch,
+    Lissajous,
+    Bubbles,
+    KeyColor,
+    MidSide,
+    Eq24,
+    PanNeedle,
+    Collision,
+    Snake,
     Ripple,
+    Gravcenter,
+    Melt,
+    Wavelength,
+}
+
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum AudioAnalysis {
+    Auto,
+    #[default]
+    Classic,
+    Accurate,
+    Beats,
+    Spectrum,
+    Mel,
+    Studio,
+    Hpss,
+    Complex,
+    Tempo,
 }
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq)]
@@ -504,6 +611,436 @@ impl BatteryParams {
     }
 }
 
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum TypeHeatPalette {
+    #[default]
+    Heat,
+    Ice,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TypeHeatParams {
+    pub heat: f32,
+    pub cool: f32,
+    pub hold_boost: f32,
+    pub background: f32,
+    pub palette: TypeHeatPalette,
+}
+
+impl Default for TypeHeatParams {
+    fn default() -> Self {
+        Self {
+            heat: 0.28,
+            cool: 0.55,
+            hold_boost: 0.35,
+            background: 0.04,
+            palette: TypeHeatPalette::Heat,
+        }
+    }
+}
+
+impl TypeHeatParams {
+    pub fn normalized(self) -> Self {
+        Self {
+            heat: self.heat.clamp(0.05, 0.8),
+            cool: self.cool.clamp(0.1, 2.0),
+            hold_boost: self.hold_boost.clamp(0.0, 1.2),
+            background: self.background.clamp(0.0, 0.4),
+            palette: self.palette,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum PacificaPalette {
+    #[default]
+    Ocean,
+    Ice,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PacificaParams {
+    pub speed: f32,
+    pub intensity: f32,
+    pub depth: f32,
+    pub background: f32,
+    pub palette: PacificaPalette,
+}
+
+impl Default for PacificaParams {
+    fn default() -> Self {
+        Self {
+            speed: 0.55,
+            intensity: 0.85,
+            depth: 0.7,
+            background: 0.08,
+            palette: PacificaPalette::Ocean,
+        }
+    }
+}
+
+impl PacificaParams {
+    pub fn normalized(self) -> Self {
+        Self {
+            speed: self.speed.clamp(0.08, 2.0),
+            intensity: self.intensity.clamp(0.2, 1.0),
+            depth: self.depth.clamp(0.15, 1.0),
+            background: self.background.clamp(0.0, 0.4),
+            palette: self.palette,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum DigitalRainPalette {
+    #[default]
+    Matrix,
+    Ice,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DigitalRainParams {
+    pub density: f32,
+    pub speed: f32,
+    pub trail: f32,
+    pub background: f32,
+    pub palette: DigitalRainPalette,
+}
+
+impl Default for DigitalRainParams {
+    fn default() -> Self {
+        Self {
+            density: 0.55,
+            speed: 0.9,
+            trail: 0.55,
+            background: 0.04,
+            palette: DigitalRainPalette::Matrix,
+        }
+    }
+}
+
+impl DigitalRainParams {
+    pub fn normalized(self) -> Self {
+        Self {
+            density: self.density.clamp(0.08, 1.0),
+            speed: self.speed.clamp(0.15, 2.5),
+            trail: self.trail.clamp(0.1, 1.0),
+            background: self.background.clamp(0.0, 0.35),
+            palette: self.palette,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum FireworksPalette {
+    #[default]
+    Festival,
+    Ice,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FireworksParams {
+    pub rate: f32,
+    pub size: f32,
+    pub trail: f32,
+    pub background: f32,
+    pub palette: FireworksPalette,
+}
+
+impl Default for FireworksParams {
+    fn default() -> Self {
+        Self {
+            rate: 0.45,
+            size: 0.4,
+            trail: 0.55,
+            background: 0.03,
+            palette: FireworksPalette::Festival,
+        }
+    }
+}
+
+impl FireworksParams {
+    pub fn normalized(self) -> Self {
+        Self {
+            rate: self.rate.clamp(0.05, 1.0),
+            size: self.size.clamp(0.12, 1.0),
+            trail: self.trail.clamp(0.1, 1.0),
+            background: self.background.clamp(0.0, 0.3),
+            palette: self.palette,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum NexusPalette {
+    #[default]
+    Cyan,
+    Heat,
+    Ice,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NexusParams {
+    pub pulse: f32,
+    pub fade: f32,
+    pub cross: f32,
+    pub background: f32,
+    pub palette: NexusPalette,
+}
+
+impl Default for NexusParams {
+    fn default() -> Self {
+        Self {
+            pulse: 1.0,
+            fade: 0.7,
+            cross: 0.75,
+            background: 0.03,
+            palette: NexusPalette::Cyan,
+        }
+    }
+}
+
+impl NexusParams {
+    pub fn normalized(self) -> Self {
+        Self {
+            pulse: self.pulse.clamp(0.2, 1.5),
+            fade: self.fade.clamp(0.15, 2.0),
+            cross: self.cross.clamp(0.15, 1.0),
+            background: self.background.clamp(0.0, 0.35),
+            palette: self.palette,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum CometPalette {
+    #[default]
+    Heat,
+    Ice,
+    Custom,
+    Rainbow,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CometParams {
+    pub speed: f32,
+    pub tail: f32,
+    pub size: f32,
+    pub background: f32,
+    pub dual: bool,
+    pub path: ScannerPath,
+    pub direction: Direction,
+    pub palette: CometPalette,
+    #[serde(default = "default_comet_head")]
+    pub head: f32,
+    #[serde(default = "default_comet_glow")]
+    pub glow: f32,
+    #[serde(default = "default_comet_fade")]
+    pub fade: f32,
+    #[serde(default = "default_comet_wobble")]
+    pub wobble: f32,
+    #[serde(default = "default_comet_hue_speed")]
+    pub hue_speed: f32,
+    #[serde(default = "default_comet_sparkle")]
+    pub sparkle: f32,
+    #[serde(default = "default_comet_saturation")]
+    pub saturation: f32,
+    #[serde(default = "default_comet_gap")]
+    pub gap: f32,
+    #[serde(default = "default_comet_follow")]
+    pub follow: f32,
+    #[serde(default)]
+    pub opposite: bool,
+    #[serde(default)]
+    pub triple: bool,
+}
+
+impl Default for CometParams {
+    fn default() -> Self {
+        Self {
+            speed: 0.85,
+            tail: 0.72,
+            size: 0.45,
+            background: 0.03,
+            dual: false,
+            path: ScannerPath::Wrap,
+            direction: Direction::Right,
+            palette: CometPalette::Heat,
+            head: default_comet_head(),
+            glow: default_comet_glow(),
+            fade: default_comet_fade(),
+            wobble: default_comet_wobble(),
+            hue_speed: default_comet_hue_speed(),
+            sparkle: default_comet_sparkle(),
+            saturation: default_comet_saturation(),
+            gap: default_comet_gap(),
+            follow: default_comet_follow(),
+            opposite: false,
+            triple: false,
+        }
+    }
+}
+
+impl CometParams {
+    pub fn normalized(self) -> Self {
+        Self {
+            speed: self.speed.clamp(0.08, 3.0),
+            tail: self.tail.clamp(0.08, 1.0),
+            size: self.size.clamp(0.08, 1.0),
+            background: self.background.clamp(0.0, 0.45),
+            dual: self.dual,
+            path: self.path,
+            direction: self.direction,
+            palette: self.palette,
+            head: self.head.clamp(0.25, 1.6),
+            glow: self.glow.clamp(0.0, 1.0),
+            fade: self.fade.clamp(0.45, 2.8),
+            wobble: self.wobble.clamp(0.0, 1.0),
+            hue_speed: self.hue_speed.clamp(0.0, 2.5),
+            sparkle: self.sparkle.clamp(0.0, 1.0),
+            saturation: self.saturation.clamp(0.15, 1.0),
+            gap: self.gap.clamp(0.18, 0.72),
+            follow: self.follow.clamp(0.2, 1.0),
+            opposite: self.opposite,
+            triple: self.triple && self.dual,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum JugglePalette {
+    #[default]
+    Rainbow,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct JuggleParams {
+    pub dots: f32,
+    pub speed: f32,
+    pub trail: f32,
+    pub background: f32,
+    pub palette: JugglePalette,
+}
+
+impl Default for JuggleParams {
+    fn default() -> Self {
+        Self {
+            dots: 5.0,
+            speed: 0.7,
+            trail: 0.62,
+            background: 0.03,
+            palette: JugglePalette::Rainbow,
+        }
+    }
+}
+
+impl JuggleParams {
+    pub fn normalized(self) -> Self {
+        Self {
+            dots: self.dots.clamp(2.0, 8.0),
+            speed: self.speed.clamp(0.15, 2.4),
+            trail: self.trail.clamp(0.1, 1.0),
+            background: self.background.clamp(0.0, 0.4),
+            palette: self.palette,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum BouncePalette {
+    #[default]
+    Rainbow,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BounceParams {
+    pub count: f32,
+    pub gravity: f32,
+    pub size: f32,
+    pub trail: f32,
+    pub background: f32,
+    pub palette: BouncePalette,
+}
+
+impl Default for BounceParams {
+    fn default() -> Self {
+        Self {
+            count: 3.0,
+            gravity: 0.7,
+            size: 0.35,
+            trail: 0.55,
+            background: 0.03,
+            palette: BouncePalette::Rainbow,
+        }
+    }
+}
+
+impl BounceParams {
+    pub fn normalized(self) -> Self {
+        Self {
+            count: self.count.clamp(1.0, 8.0),
+            gravity: self.gravity.clamp(0.15, 1.6),
+            size: self.size.clamp(0.1, 1.0),
+            trail: self.trail.clamp(0.08, 1.0),
+            background: self.background.clamp(0.0, 0.4),
+            palette: self.palette,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize, EnumIter, EnumString, PartialEq, Eq)]
+pub enum DissolvePalette {
+    #[default]
+    Custom,
+    Rainbow,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DissolveParams {
+    pub speed: f32,
+    pub background: f32,
+    pub random_colors: bool,
+    pub palette: DissolvePalette,
+}
+
+impl Default for DissolveParams {
+    fn default() -> Self {
+        Self {
+            speed: 0.7,
+            background: 0.04,
+            random_colors: false,
+            palette: DissolvePalette::Custom,
+        }
+    }
+}
+
+impl DissolveParams {
+    pub fn normalized(self) -> Self {
+        Self {
+            speed: self.speed.clamp(0.15, 2.2),
+            background: self.background.clamp(0.0, 0.4),
+            random_colors: self.random_colors,
+            palette: self.palette,
+        }
+    }
+}
+
 impl PartialEq for Effects {
     fn eq(&self, other: &Self) -> bool {
         core::mem::discriminant(self) == core::mem::discriminant(other)
@@ -559,6 +1096,60 @@ impl Effects {
                         ..
                     },
                 }
+                | Self::TypeHeat {
+                    params: TypeHeatParams {
+                        palette: TypeHeatPalette::Custom,
+                        ..
+                    },
+                }
+                | Self::Pacifica {
+                    params: PacificaParams {
+                        palette: PacificaPalette::Custom,
+                        ..
+                    },
+                }
+                | Self::DigitalRain {
+                    params: DigitalRainParams {
+                        palette: DigitalRainPalette::Custom,
+                        ..
+                    },
+                }
+                | Self::Fireworks {
+                    params: FireworksParams {
+                        palette: FireworksPalette::Custom,
+                        ..
+                    },
+                }
+                | Self::Nexus {
+                    params: NexusParams {
+                        palette: NexusPalette::Custom,
+                        ..
+                    },
+                }
+                | Self::Comet {
+                    params: CometParams {
+                        palette: CometPalette::Custom,
+                        ..
+                    },
+                }
+                | Self::Juggle {
+                    params: JuggleParams {
+                        palette: JugglePalette::Custom,
+                        ..
+                    },
+                }
+                | Self::Bounce {
+                    params: BounceParams {
+                        palette: BouncePalette::Custom,
+                        ..
+                    },
+                }
+                | Self::Dissolve {
+                    params: DissolveParams {
+                        palette: DissolvePalette::Custom,
+                        ..
+                    },
+                }
         )
     }
 
@@ -569,7 +1160,20 @@ impl Effects {
     pub fn is_scene(self) -> bool {
         matches!(
             self,
-            Self::Stars { .. } | Self::Rain { .. } | Self::Aurora { .. } | Self::Scanner { .. } | Self::Battery { .. }
+            Self::Stars { .. }
+                | Self::Rain { .. }
+                | Self::Aurora { .. }
+                | Self::Scanner { .. }
+                | Self::Battery { .. }
+                | Self::TypeHeat { .. }
+                | Self::Pacifica { .. }
+                | Self::DigitalRain { .. }
+                | Self::Fireworks { .. }
+                | Self::Nexus { .. }
+                | Self::Comet { .. }
+                | Self::Juggle { .. }
+                | Self::Bounce { .. }
+                | Self::Dissolve { .. }
         )
     }
 
@@ -625,6 +1229,7 @@ impl Effects {
             ripple_shock_sensitivity: 0.55,
             color_mode: AudioColorMode::Custom,
             style: AudioStyle::Levels,
+            analysis: AudioAnalysis::Auto,
         }
     }
 
@@ -679,6 +1284,60 @@ impl Effects {
         }
     }
 
+    pub fn type_heat_default() -> Self {
+        Self::TypeHeat {
+            params: TypeHeatParams::default(),
+        }
+    }
+
+    pub fn pacifica_default() -> Self {
+        Self::Pacifica {
+            params: PacificaParams::default(),
+        }
+    }
+
+    pub fn digital_rain_default() -> Self {
+        Self::DigitalRain {
+            params: DigitalRainParams::default(),
+        }
+    }
+
+    pub fn fireworks_default() -> Self {
+        Self::Fireworks {
+            params: FireworksParams::default(),
+        }
+    }
+
+    pub fn nexus_default() -> Self {
+        Self::Nexus {
+            params: NexusParams::default(),
+        }
+    }
+
+    pub fn comet_default() -> Self {
+        Self::Comet {
+            params: CometParams::default(),
+        }
+    }
+
+    pub fn juggle_default() -> Self {
+        Self::Juggle {
+            params: JuggleParams::default(),
+        }
+    }
+
+    pub fn bounce_default() -> Self {
+        Self::Bounce {
+            params: BounceParams::default(),
+        }
+    }
+
+    pub fn dissolve_default() -> Self {
+        Self::Dissolve {
+            params: DissolveParams::default(),
+        }
+    }
+
     pub fn factory_default(self) -> Self {
         match self {
             Self::AudioReact { .. } => Self::audio_react_default(),
@@ -690,6 +1349,15 @@ impl Effects {
             Self::Aurora { .. } => Self::aurora_default(),
             Self::Scanner { .. } => Self::scanner_default(),
             Self::Battery { .. } => Self::battery_default(),
+            Self::TypeHeat { .. } => Self::type_heat_default(),
+            Self::Pacifica { .. } => Self::pacifica_default(),
+            Self::DigitalRain { .. } => Self::digital_rain_default(),
+            Self::Fireworks { .. } => Self::fireworks_default(),
+            Self::Nexus { .. } => Self::nexus_default(),
+            Self::Comet { .. } => Self::comet_default(),
+            Self::Juggle { .. } => Self::juggle_default(),
+            Self::Bounce { .. } => Self::bounce_default(),
+            Self::Dissolve { .. } => Self::dissolve_default(),
             other => other,
         }
     }

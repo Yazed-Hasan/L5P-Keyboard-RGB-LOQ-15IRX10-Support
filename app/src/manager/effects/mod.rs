@@ -4,23 +4,42 @@ use strum::IntoEnumIterator;
 
 use crate::{
     enums::{
-        AudioColorMode, AudioStyle, AuroraPalette, BatteryPalette, Direction, Effects, RainPalette, RippleKind, RippleOrigin,
-        RippleTint, RippleTrigger, ScannerPalette, ScannerPath, StarsPalette, SwipeMode,
+        AudioColorMode, AudioStyle, AudioAnalysis, AuroraPalette, BatteryPalette, BouncePalette, CometPalette, DigitalRainPalette,
+        Direction, DissolvePalette, Effects, FireworksPalette, JugglePalette, NexusPalette, PacificaPalette, RainPalette, RippleKind,
+        RippleOrigin, RippleTint, RippleTrigger, ScannerPalette, ScannerPath, StarsPalette, SwipeMode, TypeHeatPalette,
     },
     manager::profile::Profile,
 };
 
+use self::audio::AudioHud;
+
 pub mod ambient;
 pub mod audio;
+pub mod audio_auto;
+pub mod audio_beats;
 pub mod audio_color;
+pub mod audio_dsp;
+pub mod audio_flow;
+pub mod audio_hpss;
+pub mod audio_mel;
+pub mod audio_onset;
+pub mod audio_tempo;
 pub mod aurora;
 pub mod battery;
+pub mod bounce;
 pub mod christmas;
+pub mod comet;
 pub mod default_ui;
+pub mod digital_rain;
 pub mod disco;
+pub mod dissolve;
 pub mod fade;
+pub mod fireworks;
+pub mod juggle;
 pub mod lamps;
 pub mod lightning;
+pub mod nexus;
+pub mod pacifica;
 pub mod rain;
 pub mod ripple;
 pub(crate) mod scene;
@@ -28,6 +47,7 @@ pub mod scanner;
 pub mod stars;
 pub mod swipe;
 pub mod temperature;
+pub mod typeheat;
 pub mod zones;
 
 pub fn show_effect_ui(
@@ -37,6 +57,7 @@ pub fn show_effect_ui(
     theme: &crate::gui::style::Theme,
     is_dynamic_lighting: bool,
     live_speed: &mut Option<u8>,
+    hud: AudioHud,
 ) {
     let mut effect = profile.effect;
 
@@ -53,7 +74,7 @@ pub fn show_effect_ui(
                     ComboBox::from_label("Swipe mode").width(30.0).selected_text(format!("{:?}", mode)),
                     "Change swaps colors as the wave moves. Fill paints the keyboard then clears it.",
                     |ui| {
-                        for swipe_mode in SwipeMode::iter() {
+                    for swipe_mode in SwipeMode::iter() {
                             *update_lights |= apply_tip(
                                 ui.selectable_value(mode, swipe_mode, format!("{:?}", swipe_mode)),
                                 swipe_mode_tip(swipe_mode),
@@ -101,6 +122,7 @@ pub fn show_effect_ui(
             ripple_shock_sensitivity,
             color_mode,
             style,
+            analysis,
         } => {
             ui.scope(|ui| {
                 ui.style_mut().spacing.item_spacing = theme.spacing.default;
@@ -191,6 +213,39 @@ pub fn show_effect_ui(
                 if let Some((label, hint)) = audio_color::swatch_hint(*color_mode) {
                     apply_tip(ui.label(label), hint);
                 }
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Analysis").width(90.0).selected_text(audio_analysis_name(*analysis)),
+                    "How the sound is measured. Style is how lights are arranged. Auto picks among Classic, Accurate, Beats, Spectrum, Mel, Studio, HPSS, Complex, and Tempo on both 4-zone and 24-lamp. Classic is never used on 24-lamp.",
+                    |ui| {
+                        for value in AudioAnalysis::iter() {
+                            apply_tip(
+                                ui.selectable_value(analysis, value, audio_analysis_name(value)),
+                                audio_analysis_tip(value),
+                            );
+                        }
+                    },
+                );
+                if matches!(*analysis, AudioAnalysis::Auto) {
+                    apply_tip(
+                        ui.label(format!("now: {}", audio_analysis_name(hud.resolved))),
+                        "What Auto is using right now. It only switches after the music holds that feel for about a second.",
+                    );
+                }
+                ui.horizontal(|ui| {
+                    let bpm_txt = if hud.locked && hud.bpm > 0 {
+                        format!("BPM: {}", hud.bpm)
+                    } else {
+                        "BPM: —".to_string()
+                    };
+                    apply_tip(
+                        ui.label(bpm_txt),
+                        "Detected tempo from the beat tracker. A dash means it has not locked onto a steady beat yet.",
+                    );
+                    if hud.drop {
+                        apply_tip(ui.label("drop"), "A kick or bass drop just hit.");
+                    }
+                });
                 combo_tip(
                     ui,
                     ComboBox::from_label("Style").width(90.0).selected_text(audio_style_name(*style)),
@@ -495,6 +550,268 @@ pub fn show_effect_ui(
                 );
             });
         }
+        Effects::TypeHeat { params } => {
+            ui.scope(|ui| {
+                ui.style_mut().spacing.item_spacing = theme.spacing.default;
+                show_brightness(ui, profile, update_lights, is_dynamic_lighting);
+                slider_tip(ui, &mut params.heat, 0.05..=0.8, "Heat per key", "How much hotter a zone gets each time you press a key there.", 0.28);
+                slider_tip(ui, &mut params.cool, 0.1..=2.0, "Cool rate", "How fast unused zones fade back to the background. Higher cools quicker.", 0.55);
+                slider_tip(ui, &mut params.hold_boost, 0.0..=1.2, "Hold boost", "Extra heat while a key is held down. 0 only counts the press.", 0.35);
+                slider_tip(ui, &mut params.background, 0.0..=0.4, "Background", "Dim leftover glow so idle keys are not fully dark.", 0.04);
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Palette").width(90.0).selected_text(typeheat_palette_name(params.palette)),
+                    "Heat is blue-black to orange-white. Ice stays cool. Custom uses the zone swatches as the hot color.",
+                    |ui| {
+                        for pal in TypeHeatPalette::iter() {
+                            apply_tip(
+                                ui.selectable_value(&mut params.palette, pal, typeheat_palette_name(pal)),
+                                typeheat_palette_tip(pal),
+                            );
+                        }
+                    },
+                );
+            });
+        }
+        Effects::Pacifica { params } => {
+            ui.scope(|ui| {
+                ui.style_mut().spacing.item_spacing = theme.spacing.default;
+                show_brightness(ui, profile, update_lights, is_dynamic_lighting);
+                slider_tip(ui, &mut params.speed, 0.08..=2.0, "Speed", "How fast the overlapping ocean layers drift.", 0.55);
+                slider_tip(ui, &mut params.intensity, 0.2..=1.0, "Intensity", "How bright the wave crests get.", 0.85);
+                slider_tip(ui, &mut params.depth, 0.15..=1.0, "Depth", "How many overlapping sines mix. Higher looks more like deep water.", 0.7);
+                slider_tip(ui, &mut params.background, 0.0..=0.4, "Background", "Dim leftover glow in the troughs.", 0.08);
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Palette").width(90.0).selected_text(pacifica_palette_name(params.palette)),
+                    "Ocean is classic blue-green. Ice is colder. Custom uses the zone swatches.",
+                    |ui| {
+                        for pal in PacificaPalette::iter() {
+                            apply_tip(
+                                ui.selectable_value(&mut params.palette, pal, pacifica_palette_name(pal)),
+                                pacifica_palette_tip(pal),
+                            );
+                        }
+                    },
+                );
+            });
+        }
+        Effects::DigitalRain { params } => {
+            ui.scope(|ui| {
+                ui.style_mut().spacing.item_spacing = theme.spacing.default;
+                show_brightness(ui, profile, update_lights, is_dynamic_lighting);
+                slider_tip(ui, &mut params.density, 0.08..=1.0, "Density", "How many traveling heads are active at once.", 0.55);
+                slider_tip(ui, &mut params.speed, 0.15..=2.5, "Speed", "How fast the heads travel across the keyboard.", 0.9);
+                slider_tip(ui, &mut params.trail, 0.1..=1.0, "Trail", "How long the streak behind each head stays lit.", 0.55);
+                slider_tip(ui, &mut params.background, 0.0..=0.35, "Background", "Dim leftover glow so idle columns are not fully dark.", 0.04);
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Palette").width(90.0).selected_text(digital_rain_palette_name(params.palette)),
+                    "Matrix is green. Ice is cyan. Custom uses the zone swatches.",
+                    |ui| {
+                        for pal in DigitalRainPalette::iter() {
+                            apply_tip(
+                                ui.selectable_value(&mut params.palette, pal, digital_rain_palette_name(pal)),
+                                digital_rain_palette_tip(pal),
+                            );
+                        }
+                    },
+                );
+            });
+        }
+        Effects::Fireworks { params } => {
+            ui.scope(|ui| {
+                ui.style_mut().spacing.item_spacing = theme.spacing.default;
+                show_brightness(ui, profile, update_lights, is_dynamic_lighting);
+                slider_tip(ui, &mut params.rate, 0.05..=1.0, "Rate", "How often new bursts spawn.", 0.45);
+                slider_tip(ui, &mut params.size, 0.12..=1.0, "Size", "How wide each burst spreads.", 0.4);
+                slider_tip(ui, &mut params.trail, 0.1..=1.0, "Trail", "How slowly bursts fade after they pop.", 0.55);
+                slider_tip(ui, &mut params.background, 0.0..=0.3, "Background", "Dim night-sky leftover.", 0.03);
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Palette").width(90.0).selected_text(fireworks_palette_name(params.palette)),
+                    "Festival is mixed warm bursts. Ice is cool. Custom uses the zone swatches.",
+                    |ui| {
+                        for pal in FireworksPalette::iter() {
+                            apply_tip(
+                                ui.selectable_value(&mut params.palette, pal, fireworks_palette_name(pal)),
+                                fireworks_palette_tip(pal),
+                            );
+                        }
+                    },
+                );
+            });
+        }
+        Effects::Nexus { params } => {
+            ui.scope(|ui| {
+                ui.style_mut().spacing.item_spacing = theme.spacing.default;
+                show_brightness(ui, profile, update_lights, is_dynamic_lighting);
+                slider_tip(ui, &mut params.pulse, 0.2..=1.5, "Pulse", "How bright the plus-shape is on a key press.", 1.0);
+                slider_tip(ui, &mut params.fade, 0.15..=2.0, "Fade", "How fast the plus fades. Higher dies quicker.", 0.7);
+                slider_tip(ui, &mut params.cross, 0.15..=1.0, "Cross", "Brightness of the horizontal bar vs the pressed strip.", 0.75);
+                slider_tip(ui, &mut params.background, 0.0..=0.35, "Background", "Dim leftover glow when you are not typing.", 0.03);
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Palette").width(90.0).selected_text(nexus_palette_name(params.palette)),
+                    "Cyan is the classic reactive plus. Heat and Ice recolor it. Custom uses the zone swatches.",
+                    |ui| {
+                        for pal in NexusPalette::iter() {
+                            apply_tip(
+                                ui.selectable_value(&mut params.palette, pal, nexus_palette_name(pal)),
+                                nexus_palette_tip(pal),
+                            );
+                        }
+                    },
+                );
+            });
+        }
+        Effects::Comet { params } => {
+            ui.scope(|ui| {
+                ui.style_mut().spacing.item_spacing = theme.spacing.default;
+                show_brightness(ui, profile, update_lights, is_dynamic_lighting);
+                slider_tip(ui, &mut params.speed, 0.08..=3.0, "Speed", "How fast the meteor crosses the keyboard.", 0.85);
+                slider_tip(ui, &mut params.wobble, 0.0..=1.0, "Wobble", "Speed pulse as it travels. Zero is a perfectly steady pass.", 0.35);
+                slider_tip(ui, &mut params.size, 0.08..=1.0, "Size", "How wide the bright head is.", 0.45);
+                slider_tip(ui, &mut params.head, 0.25..=1.6, "Head", "How bright the core is versus the tail.", 1.0);
+                slider_tip(ui, &mut params.glow, 0.0..=1.0, "Glow", "Soft halo around the head. Zero is a hard meteor.", 0.22);
+                slider_tip(ui, &mut params.tail, 0.08..=1.0, "Tail", "How long the streak behind the head stays lit.", 0.72);
+                slider_tip(ui, &mut params.fade, 0.45..=2.8, "Fade", "How fast the tail drops off. Low is a fat streak; high is a sharp needle.", 1.25);
+                slider_tip(ui, &mut params.sparkle, 0.0..=1.0, "Sparkle", "Glitter along the tail. Zero keeps a clean streak.", 0.0);
+                slider_tip(ui, &mut params.hue_speed, 0.0..=2.5, "Hue speed", "How fast Heat / Ice / Rainbow drift. Zero holds the color still.", 1.0);
+                slider_tip(ui, &mut params.saturation, 0.15..=1.0, "Saturation", "How strong the color is. Lower fades toward white/grey.", 1.0);
+                slider_tip(ui, &mut params.background, 0.0..=0.45, "Background", "Dim leftover glow away from the comet.", 0.03);
+                ui.horizontal(|ui| {
+                    const TIP: &str = "Adds a second comet. Extra spacing and direction settings appear when this is on.";
+                    apply_tip(ui.checkbox(&mut params.dual, "Second comet"), TIP);
+                    apply_tip(ui.small_button("?"), TIP);
+                    if reset_btn(ui, params.dual, false) {
+                        params.dual = false;
+                        params.triple = false;
+                    }
+                });
+                if params.dual {
+                    ui.indent("comet_dual_settings", |ui| {
+                        slider_tip(ui, &mut params.gap, 0.18..=0.72, "Gap", "How far behind the second comet sits.", 0.46);
+                        slider_tip(ui, &mut params.follow, 0.2..=1.0, "Follow", "Brightness of the extra comet(s) versus the main one.", 0.62);
+                        ui.horizontal(|ui| {
+                            const TIP: &str = "The extra comet(s) travel the other way.";
+                            apply_tip(ui.checkbox(&mut params.opposite, "Opposite"), TIP);
+                            apply_tip(ui.small_button("?"), TIP);
+                            if reset_btn(ui, params.opposite, false) {
+                                params.opposite = false;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            const TIP: &str = "Adds a third, even dimmer comet.";
+                            apply_tip(ui.checkbox(&mut params.triple, "Third comet"), TIP);
+                            apply_tip(ui.small_button("?"), TIP);
+                            if reset_btn(ui, params.triple, false) {
+                                params.triple = false;
+                            }
+                        });
+                    });
+                } else {
+                    params.triple = false;
+                }
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Path").width(80.0).selected_text(scanner_path_name(params.path)),
+                    "Wrap flies off one side and re-enters the other. Bounce turns around at the ends.",
+                    |ui| {
+                        for path in ScannerPath::iter() {
+                            apply_tip(ui.selectable_value(&mut params.path, path, scanner_path_name(path)), scanner_path_tip(path));
+                        }
+                    },
+                );
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Direction").width(70.0).selected_text(format!("{:?}", params.direction)),
+                    "Travel direction. Bounce still reverses at the ends.",
+                    |ui| {
+                        for dir in Direction::iter() {
+                            ui.selectable_value(&mut params.direction, dir, format!("{dir:?}"));
+                        }
+                    },
+                );
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Palette").width(90.0).selected_text(comet_palette_name(params.palette)),
+                    "Heat is a fireball. Ice is a cold meteor. Custom uses the zone swatches. Rainbow drifts with Hue speed.",
+                    |ui| {
+                        for pal in CometPalette::iter() {
+                            apply_tip(ui.selectable_value(&mut params.palette, pal, comet_palette_name(pal)), comet_palette_tip(pal));
+                        }
+                    },
+                );
+            });
+        }
+        Effects::Juggle { params } => {
+            ui.scope(|ui| {
+                ui.style_mut().spacing.item_spacing = theme.spacing.default;
+                show_brightness(ui, profile, update_lights, is_dynamic_lighting);
+                slider_tip(ui, &mut params.dots, 2.0..=8.0, "Dots", "How many colored dots are juggling at once.", 5.0);
+                slider_tip(ui, &mut params.speed, 0.15..=2.4, "Speed", "How fast the dots weave back and forth.", 0.7);
+                slider_tip(ui, &mut params.trail, 0.1..=1.0, "Trail", "How long each dot's streak stays lit.", 0.62);
+                slider_tip(ui, &mut params.background, 0.0..=0.4, "Background", "Dim leftover glow away from the dots.", 0.03);
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Palette").width(90.0).selected_text(juggle_palette_name(params.palette)),
+                    "Rainbow gives each dot its own hue. Custom uses the zone swatches.",
+                    |ui| {
+                        for pal in JugglePalette::iter() {
+                            apply_tip(ui.selectable_value(&mut params.palette, pal, juggle_palette_name(pal)), juggle_palette_tip(pal));
+                        }
+                    },
+                );
+            });
+        }
+        Effects::Bounce { params } => {
+            ui.scope(|ui| {
+                ui.style_mut().spacing.item_spacing = theme.spacing.default;
+                show_brightness(ui, profile, update_lights, is_dynamic_lighting);
+                slider_tip(ui, &mut params.count, 1.0..=8.0, "Balls", "How many balls bounce along the keyboard.", 3.0);
+                slider_tip(ui, &mut params.gravity, 0.15..=1.6, "Gravity", "How hard they fall toward an edge. Higher is snappier.", 0.7);
+                slider_tip(ui, &mut params.size, 0.1..=1.0, "Size", "How wide each ball lights the keys.", 0.35);
+                slider_tip(ui, &mut params.trail, 0.08..=1.0, "Trail", "Motion blur behind each bounce.", 0.55);
+                slider_tip(ui, &mut params.background, 0.0..=0.4, "Background", "Dim leftover glow away from the balls.", 0.03);
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Palette").width(90.0).selected_text(bounce_palette_name(params.palette)),
+                    "Rainbow colors by ball. Custom uses the zone swatches.",
+                    |ui| {
+                        for pal in BouncePalette::iter() {
+                            apply_tip(ui.selectable_value(&mut params.palette, pal, bounce_palette_name(pal)), bounce_palette_tip(pal));
+                        }
+                    },
+                );
+            });
+        }
+        Effects::Dissolve { params } => {
+            ui.scope(|ui| {
+                ui.style_mut().spacing.item_spacing = theme.spacing.default;
+                show_brightness(ui, profile, update_lights, is_dynamic_lighting);
+                slider_tip(ui, &mut params.speed, 0.15..=2.2, "Speed", "How fast keys fill in and melt away.", 0.7);
+                slider_tip(ui, &mut params.background, 0.0..=0.4, "Background", "Glow on keys that are waiting to fill.", 0.04);
+                ui.horizontal(|ui| {
+                    const TIP: &str = "Each filled key picks a random hue instead of the palette.";
+                    apply_tip(ui.checkbox(&mut params.random_colors, "Random colors"), TIP);
+                    apply_tip(ui.small_button("?"), TIP);
+                    if reset_btn(ui, params.random_colors, false) {
+                        params.random_colors = false;
+                    }
+                });
+                combo_tip(
+                    ui,
+                    ComboBox::from_label("Palette").width(90.0).selected_text(dissolve_palette_name(params.palette)),
+                    "Custom uses the zone swatches. Rainbow walks hue across the keys. Random colors overrides this.",
+                    |ui| {
+                        for pal in DissolvePalette::iter() {
+                            apply_tip(ui.selectable_value(&mut params.palette, pal, dissolve_palette_name(pal)), dissolve_palette_tip(pal));
+                        }
+                    },
+                );
+            });
+        }
         Effects::AmbientLight { fps, saturation_boost } => {
             ui.scope(|ui| {
                 ui.style_mut().spacing.item_spacing = theme.spacing.default;
@@ -605,7 +922,52 @@ fn audio_style_name(style: AudioStyle) -> &'static str {
         AudioStyle::BeatGates => "Beat Gates",
         AudioStyle::Vu => "VU Meter",
         AudioStyle::TempoPulse => "Tempo Pulse",
+        AudioStyle::Oscilloscope => "Oscilloscope",
+        AudioStyle::Spectrogram => "Spectrogram",
+        AudioStyle::Stereo => "Stereo Split",
+        AudioStyle::Pitch => "Pitch Color",
+        AudioStyle::Lissajous => "Lissajous",
+        AudioStyle::Bubbles => "Audio Bubbles",
+        AudioStyle::KeyColor => "Key Color",
+        AudioStyle::MidSide => "Mid-Side",
+        AudioStyle::Eq24 => "24-band EQ",
+        AudioStyle::PanNeedle => "Pan Needle",
+        AudioStyle::Collision => "Collision",
+        AudioStyle::Snake => "Snake",
         AudioStyle::Ripple => "Ripple",
+        AudioStyle::Gravcenter => "Gravcenter",
+        AudioStyle::Melt => "Melt",
+        AudioStyle::Wavelength => "Wavelength",
+    }
+}
+
+fn audio_analysis_name(mode: AudioAnalysis) -> &'static str {
+    match mode {
+        AudioAnalysis::Auto => "Auto",
+        AudioAnalysis::Classic => "Classic",
+        AudioAnalysis::Accurate => "Accurate",
+        AudioAnalysis::Beats => "Beats",
+        AudioAnalysis::Spectrum => "Spectrum",
+        AudioAnalysis::Mel => "Mel",
+        AudioAnalysis::Studio => "Studio",
+        AudioAnalysis::Hpss => "HPSS",
+        AudioAnalysis::Complex => "Complex",
+        AudioAnalysis::Tempo => "Tempo",
+    }
+}
+
+fn audio_analysis_tip(mode: AudioAnalysis) -> &'static str {
+    match mode {
+        AudioAnalysis::Auto => "Listens to the mix and switches among Accurate, Beats, Spectrum, Mel, Studio, HPSS, Complex, Tempo, and Classic. All of those drive 4-zone. Classic is only used on 4-zone. Lighting Style stays what you picked.",
+        AudioAnalysis::Classic => "The original 4-band analyzer. Same 4-zone look as before. Other Analysis engines also drive 4-zone from their 4-band groups.",
+        AudioAnalysis::Accurate => "Hop-synced SuperFlux: tighter kicks and a cleaner spectrum than Classic.",
+        AudioAnalysis::Beats => "Biased to kicks and onsets. Best with Ripple, Strobe, Collision, and Tempo Pulse.",
+        AudioAnalysis::Spectrum => "Biased to a truthful EQ. Best with Levels, 24-band EQ, and Spectrogram.",
+        AudioAnalysis::Mel => "LedFx-style 24 perceptual bins. Better bass/vocal spacing for 24-band EQ and Wavelength.",
+        AudioAnalysis::Studio => "FFT 4096 with hop 512. Separates low bass notes more clearly. A bit heavier than Accurate.",
+        AudioAnalysis::Hpss => "Splits drums from pads. Beats follow percussion only, so vocals are less likely to false-trigger.",
+        AudioAnalysis::Complex => "Specdiff + phase onset (LedFx/aubio). Cleaner hits on mixed music than magnitude flux alone.",
+        AudioAnalysis::Tempo => "Davies causal beat tracker for a stabler BPM. Spectrum still uses Accurate SuperFlux.",
     }
 }
 
@@ -613,7 +975,7 @@ fn audio_style_tip(style: AudioStyle) -> &'static str {
     match style {
         AudioStyle::Levels => "Each zone or strip follows its own frequency band (bass on the left, presence on the right).",
         AudioStyle::Pulse => "The whole keyboard flashes together with overall loudness.",
-        AudioStyle::Wave => "A traveling wave whose height follows the beat.",
+        AudioStyle::Wave => "A traveling wave that moves left to right with the beat. In 24-lamp mode it uses all 24 columns.",
         AudioStyle::Bloom => "Bass lights the left and spills right as it gets louder.",
         AudioStyle::Center => "Energy builds from the middle zones outward.",
         AudioStyle::Mirror => "Left and right zones mirror each other.",
@@ -623,9 +985,24 @@ fn audio_style_tip(style: AudioStyle) -> &'static str {
         AudioStyle::Chase => "A moving hotspot that races with the music.",
         AudioStyle::Gradient => "A color/brightness ramp that slides with overall energy.",
         AudioStyle::BeatGates => "Each zone or strip snaps fully on or off with its own beat.",
-        AudioStyle::Vu => "A studio meter that fills from the left with loudness. The bright tip is the recent peak.",
+        AudioStyle::Vu => "A studio meter that fills from the left with loudness. The bright tip is the recent peak. In 24-lamp mode it steps across all 24 columns.",
         AudioStyle::TempoPulse => "The whole keyboard pulses on the detected downbeat. Locks to BPM; falls back to loudness until a beat is found.",
+        AudioStyle::Oscilloscope => "Paints the raw waveform across the keys. This is the sound's shape in time, not frequency bars. In 24-lamp mode each column is a sample.",
+        AudioStyle::Spectrogram => "A scrolling heat map: left is now, right is a moment ago. Hue follows pitch, brightness follows loudness. In 24-lamp mode the history is 24 columns wide.",
+        AudioStyle::Stereo => "Left keys follow the left channel, right keys the right. Panned sounds light one side; centered sounds light both, but the quieter side stays dimmer.",
+        AudioStyle::Pitch => "The whole keyboard is one color that tracks the musical note. Brightness still follows loudness. Drums keep the last stable hue.",
+        AudioStyle::Lissajous => "A bloom from the center whose width follows stereo width, not volume. Mono sits tight in the middle; wide mixes spread to the edges.",
+        AudioStyle::Bubbles => "Bass hits spawn blobs that hop left to right and fade. Silence stays dim.",
+        AudioStyle::KeyColor => "The whole keyboard is one color that tracks the musical key (C, Am…), not the melody note. Drums keep the last stable key. Brightness follows loudness.",
+        AudioStyle::MidSide => "Inner keys follow the mid (what is common to both ears). Outer keys follow the side (what is unique to left or right).",
+        AudioStyle::Eq24 => "A real spectrum analyzer across the keyboard: bass on the far left, air on the far right. 24-lamp uses one band per column. 4-zone maps the same spectrum onto the four zones.",
+        AudioStyle::PanNeedle => "One bright column tracks left/right in the mix. Centered sound sits in the middle; panned hits jump to a side. Not Stereo Split.",
+        AudioStyle::Collision => "Two comets fire from the edges and smash in the middle on a kick or drop, then flash and fade.",
+        AudioStyle::Snake => "A wrapping snake of lit columns. It grows with loudness and crawls with the beat.",
         AudioStyle::Ripple => "A color ring spreads from the beat and shifts hue as it expands.",
+        AudioStyle::Gravcenter => "An analog VU that grows from the middle and falls with gravity. Not the left-to-right VU Meter, and not Center's band wash.",
+        AudioStyle::Melt => "Energy puddles and drips sideways like lava. Not Fire's left-to-right heat ramp.",
+        AudioStyle::Wavelength => "A traveling rainbow whose brightness follows the spectrum. Not 24-band EQ bars, not Pitch's one-note wash, not Spectrogram's history.",
     }
 }
 
@@ -678,7 +1055,7 @@ fn ripple_kind_name(kind: RippleKind) -> &'static str {
 
 fn ripple_kind_tip(kind: RippleKind) -> &'static str {
     match kind {
-        RippleKind::Ring => "A single expanding front. In 24-lamp mode it hops strip by strip.",
+        RippleKind::Ring => "A single expanding front. In 24-lamp mode it hops column by column.",
         RippleKind::Wave => "A thicker traveling band with a short trail behind the front.",
         RippleKind::Pulse => "A bloom that grows from the origin and fades, without a thin ring.",
         RippleKind::Double => "Two concentric rings: an outer front and a smaller inner ring.",
@@ -815,5 +1192,147 @@ fn battery_palette_tip(p: BatteryPalette) -> &'static str {
         BatteryPalette::Custom => "The fill samples your zone colors from left to right.",
         BatteryPalette::Ice => "Cool blue meter.",
         BatteryPalette::Heat => "Warmer color as charge rises.",
+    }
+}
+
+fn typeheat_palette_name(p: TypeHeatPalette) -> &'static str {
+    match p {
+        TypeHeatPalette::Heat => "Heat",
+        TypeHeatPalette::Ice => "Ice",
+        TypeHeatPalette::Custom => "Custom",
+    }
+}
+
+fn typeheat_palette_tip(p: TypeHeatPalette) -> &'static str {
+    match p {
+        TypeHeatPalette::Heat => "Cool dim blue-black, hot orange-white.",
+        TypeHeatPalette::Ice => "Stays icy; brighter and whiter as a zone heats up.",
+        TypeHeatPalette::Custom => "Each zone uses its swatch as the hot color.",
+    }
+}
+
+fn pacifica_palette_name(p: PacificaPalette) -> &'static str {
+    match p {
+        PacificaPalette::Ocean => "Ocean",
+        PacificaPalette::Ice => "Ice",
+        PacificaPalette::Custom => "Custom",
+    }
+}
+
+fn pacifica_palette_tip(p: PacificaPalette) -> &'static str {
+    match p {
+        PacificaPalette::Ocean => "Classic FastLED blue-green water.",
+        PacificaPalette::Ice => "Colder cyan-white waves.",
+        PacificaPalette::Custom => "Waves tint with the four zone swatches.",
+    }
+}
+
+fn digital_rain_palette_name(p: DigitalRainPalette) -> &'static str {
+    match p {
+        DigitalRainPalette::Matrix => "Matrix",
+        DigitalRainPalette::Ice => "Ice",
+        DigitalRainPalette::Custom => "Custom",
+    }
+}
+
+fn digital_rain_palette_tip(p: DigitalRainPalette) -> &'static str {
+    match p {
+        DigitalRainPalette::Matrix => "Green falling code.",
+        DigitalRainPalette::Ice => "Cyan falling code.",
+        DigitalRainPalette::Custom => "Drops use the zone swatches.",
+    }
+}
+
+fn fireworks_palette_name(p: FireworksPalette) -> &'static str {
+    match p {
+        FireworksPalette::Festival => "Festival",
+        FireworksPalette::Ice => "Ice",
+        FireworksPalette::Custom => "Custom",
+    }
+}
+
+fn fireworks_palette_tip(p: FireworksPalette) -> &'static str {
+    match p {
+        FireworksPalette::Festival => "Warm mixed burst colors.",
+        FireworksPalette::Ice => "Cool white-cyan bursts.",
+        FireworksPalette::Custom => "Bursts sample the zone swatches.",
+    }
+}
+
+fn nexus_palette_name(p: NexusPalette) -> &'static str {
+    match p {
+        NexusPalette::Cyan => "Cyan",
+        NexusPalette::Heat => "Heat",
+        NexusPalette::Ice => "Ice",
+        NexusPalette::Custom => "Custom",
+    }
+}
+
+fn nexus_palette_tip(p: NexusPalette) -> &'static str {
+    match p {
+        NexusPalette::Cyan => "Bright cyan plus on each press.",
+        NexusPalette::Heat => "Orange-red plus.",
+        NexusPalette::Ice => "Ice-blue plus.",
+        NexusPalette::Custom => "The plus uses the zone swatches.",
+    }
+}
+
+fn comet_palette_name(p: CometPalette) -> &'static str {
+    match p {
+        CometPalette::Heat => "Heat",
+        CometPalette::Ice => "Ice",
+        CometPalette::Custom => "Custom",
+        CometPalette::Rainbow => "Rainbow",
+    }
+}
+
+fn comet_palette_tip(p: CometPalette) -> &'static str {
+    match p {
+        CometPalette::Heat => "Orange-white fireball with a long hot tail.",
+        CometPalette::Ice => "Cyan-white meteor.",
+        CometPalette::Custom => "The comet uses the zone swatches.",
+        CometPalette::Rainbow => "Hue drifts along the path.",
+    }
+}
+
+fn juggle_palette_name(p: JugglePalette) -> &'static str {
+    match p {
+        JugglePalette::Rainbow => "Rainbow",
+        JugglePalette::Custom => "Custom",
+    }
+}
+
+fn juggle_palette_tip(p: JugglePalette) -> &'static str {
+    match p {
+        JugglePalette::Rainbow => "Each dot rides a shifting hue.",
+        JugglePalette::Custom => "The dots use the zone swatches.",
+    }
+}
+
+fn bounce_palette_name(p: BouncePalette) -> &'static str {
+    match p {
+        BouncePalette::Rainbow => "Rainbow",
+        BouncePalette::Custom => "Custom",
+    }
+}
+
+fn bounce_palette_tip(p: BouncePalette) -> &'static str {
+    match p {
+        BouncePalette::Rainbow => "Balls keep a moving rainbow.",
+        BouncePalette::Custom => "The balls use the zone swatches.",
+    }
+}
+
+fn dissolve_palette_name(p: DissolvePalette) -> &'static str {
+    match p {
+        DissolvePalette::Custom => "Custom",
+        DissolvePalette::Rainbow => "Rainbow",
+    }
+}
+
+fn dissolve_palette_tip(p: DissolvePalette) -> &'static str {
+    match p {
+        DissolvePalette::Custom => "Filled keys use the zone swatches.",
+        DissolvePalette::Rainbow => "Filled keys walk a rainbow across the keyboard.",
     }
 }

@@ -522,7 +522,7 @@ impl App {
         ui.with_layout(Layout::left_to_right(Align::Center).with_cross_justify(true), |ui| {
             ui.vertical(|ui| {
                 if self.lamp_count >= 8 {
-                    let text = "Off uses 4 zones (lighter). On paints all 24 lamp strips for every effect, like Legion Space.";
+                    let text = "Off uses 4 zones. On paints all 24 lamp columns left to right (this keyboard has no independent rows).";
                     ui.horizontal(|ui| {
                         if ui.checkbox(&mut self.fine_lamps, "24-lamp mode").on_hover_text(text).changed() {
                             if let Some(manager) = &self.manager {
@@ -714,6 +714,7 @@ impl App {
     fn show_effect_ui(&mut self, ui: &mut eframe::egui::Ui) {
         ui.add_enabled_ui(self.loaded_effect.is_none(), |ui| {
             let mut live_speed = None;
+            let hud = self.manager.as_ref().map(|m| m.audio_hud()).unwrap_or_default();
             show_effect_ui(
                 ui,
                 &mut self.current_profile,
@@ -721,6 +722,7 @@ impl App {
                 &self.theme,
                 self.is_dynamic_lighting,
                 &mut live_speed,
+                hud,
             );
             if let Some(speed) = live_speed {
                 if let Some(manager) = &self.manager {
@@ -792,5 +794,14 @@ fn effect_hover_tip(effect: &Effects) -> &'static str {
         Effects::Aurora { .. } => "Overlapping northern-lights bands that drift slowly.",
         Effects::Scanner { .. } => "A bouncing hotspot with a trail, like a scanner bar.",
         Effects::Battery { .. } => "A left-to-right charge meter. Pulses while plugged in.",
+        Effects::TypeHeat { .. } => "Zones heat up as you type and cool when idle. Not a spreading wave like Ripple.",
+        Effects::Pacifica { .. } => "Layered blue-green ocean sines. Not raindrops and not aurora bands.",
+        Effects::DigitalRain { .. } => "Heads travel across the keyboard with a fading trail. In 24-lamp mode they use all 24 columns.",
+        Effects::Fireworks { .. } => "Random bursts that pop and fade. No audio needed.",
+        Effects::Nexus { .. } => "A pulse on the keys you press: that quarter of columns lights, with a little bleed into the neighbors. Not a spreading ring like Ripple.",
+        Effects::Comet { .. } => "A meteor with a fat head and a long tail. Head, glow, fade, sparkle, and extra comets are on the sliders. Wrap flies off the edge; Bounce turns around. Not the short Scanner beam.",
+        Effects::Juggle { .. } => "Several colored dots weave back and forth with trails, like WLED Juggle. Not a single Scanner beam and not a Comet meteor.",
+        Effects::Bounce { .. } => "Balls fall with gravity and bounce at the ends. Physics bounce, not Comet's smooth meteor turn.",
+        Effects::Dissolve { .. } => "Keys fill in a random order, pause, then melt away. Best in 24-lamp mode.",
     }
 }

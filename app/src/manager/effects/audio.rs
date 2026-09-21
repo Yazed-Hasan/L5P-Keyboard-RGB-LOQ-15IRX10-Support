@@ -1,25 +1,24 @@
 use std::{
     f32::consts::PI,
     sync::{
-        atomic::Ordering,
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
 };
 
-use rand::Rng;
-
 use crate::{
-    enums::{AudioColorMode, AudioStyle, Effects, RippleKind, RippleOrigin, RippleTint, RippleTrigger},
+    enums::{AudioAnalysis, AudioColorMode, AudioStyle, Effects, RippleKind, RippleOrigin, RippleTint, RippleTrigger},
     manager::{
-        effects::{audio_color, lamps},
+        effects::{audio_auto, audio_beats, audio_color, audio_dsp, audio_flow, audio_hpss, audio_mel, audio_onset, audio_tempo, lamps},
         profile::Profile,
         Inner,
     },
 };
 
 const FFT_SIZE: usize = 1024;
+const RING: usize = 8192;
 const FAST_WIN: usize = 256;
 const SAMPLE_RATE: u32 = 48_000;
 pub const DEFAULT_AUDIO_RGB: [u8; 12] = [255, 24, 48, 255, 140, 16, 36, 220, 120, 72, 120, 255];
@@ -57,7 +56,31 @@ pub struct AudioReactParams {
     pub ripple_shock_sensitivity: f32,
     pub color_mode: AudioColorMode,
     pub style: AudioStyle,
+    pub analysis: AudioAnalysis,
+    pub auto_resolved: AudioAnalysis,
+    pub bpm: u16,
+    pub bpm_locked: bool,
+    pub drop: bool,
     pub custom_rgb: [u8; 12],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AudioHud {
+    pub resolved: AudioAnalysis,
+    pub bpm: u16,
+    pub locked: bool,
+    pub drop: bool,
+}
+
+impl Default for AudioHud {
+    fn default() -> Self {
+        Self {
+            resolved: AudioAnalysis::Accurate,
+            bpm: 0,
+            locked: false,
+            drop: false,
+        }
+    }
 }
 
 impl AudioReactParams {
@@ -95,6 +118,7 @@ impl AudioReactParams {
                 ripple_shock_sensitivity,
                 color_mode,
                 style,
+                analysis,
             } => Self {
                 sensitivity,
                 smoothness,
@@ -131,6 +155,11 @@ impl AudioReactParams {
                 } else {
                     style
                 },
+                analysis,
+                auto_resolved: AudioAnalysis::Accurate,
+                bpm: 0,
+                bpm_locked: false,
+                drop: false,
                 custom_rgb: DEFAULT_AUDIO_RGB,
             }
             .normalized(),
@@ -145,6 +174,19 @@ impl AudioReactParams {
             rgb
         };
         self
+    }
+
+    pub fn hud(&self) -> AudioHud {
+        AudioHud {
+            resolved: if matches!(self.auto_resolved, AudioAnalysis::Auto) {
+                AudioAnalysis::Accurate
+            } else {
+                self.auto_resolved
+            },
+            bpm: if self.bpm_locked { self.bpm } else { 0 },
+            locked: self.bpm_locked && self.bpm > 0,
+            drop: self.drop,
+        }
     }
 
     pub fn normalized(self) -> Self {
@@ -185,6 +227,15 @@ impl AudioReactParams {
             ripple_shock_sensitivity: self.ripple_shock_sensitivity.clamp(0.0, 1.0),
             color_mode: self.color_mode,
             style: self.style,
+            analysis: self.analysis,
+            auto_resolved: if matches!(self.auto_resolved, AudioAnalysis::Classic | AudioAnalysis::Auto) {
+                AudioAnalysis::Accurate
+            } else {
+                self.auto_resolved
+            },
+            bpm: self.bpm,
+            bpm_locked: self.bpm_locked,
+            drop: self.drop,
             custom_rgb: if self.custom_rgb.iter().all(|&c| c == 0) {
                 DEFAULT_AUDIO_RGB
             } else {
@@ -228,6 +279,11 @@ impl Default for AudioReactParams {
             ripple_shock_sensitivity: 0.55,
             color_mode: AudioColorMode::Custom,
             style: AudioStyle::Levels,
+            analysis: AudioAnalysis::Auto,
+            auto_resolved: AudioAnalysis::Accurate,
+            bpm: 0,
+            bpm_locked: false,
+            drop: false,
             custom_rgb: DEFAULT_AUDIO_RGB,
         }
     }
@@ -240,23 +296,27 @@ pub fn play(manager: &mut Inner, profile: &Profile) {
         *guard = AudioReactParams::from_effect(profile.effect).with_rgb(profile.rgb_array());
     }
 
-    let samples = Arc::new(Mutex::new(vec![0.0f32; FFT_SIZE]));
+    let samples = Arc::new(Mutex::new(vec![0.0f32; RING]));
+    let stereo = Arc::new(Mutex::new([vec![0.0f32; RING], vec![0.0f32; RING]]));
+    let capture_seq = Arc::new(AtomicU64::new(0));
     let capture_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop = manager.stop_signals.manager_stop_signal.clone();
     let capture_stop = stop.clone();
     let capture_samples = samples.clone();
+    let capture_stereo = stereo.clone();
     let capture_flag = capture_ok.clone();
+    let capture_seq_thread = capture_seq.clone();
 
     let capture = thread::spawn(move || {
         #[cfg(target_os = "windows")]
         {
-            if let Err(err) = capture_loopback(capture_samples, capture_stop, capture_flag) {
+            if let Err(err) = capture_loopback(capture_samples, capture_stereo, capture_seq_thread, capture_stop, capture_flag) {
                 legion_rgb_driver::debug_log(&format!("AUDIO: loopback failed: {err}"));
             }
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (capture_samples, capture_stop, capture_flag);
+            let _ = (capture_samples, capture_stereo, capture_seq_thread, capture_stop, capture_flag);
             legion_rgb_driver::debug_log("AUDIO: loopback is only available on Windows");
         }
     });
@@ -272,12 +332,6 @@ pub fn play(manager: &mut Inner, profile: &Profile) {
     let mut long_avg = [0.02f32; 4];
     let mut prev_short = [0.0f32; 4];
     let mut levels = [0.0f32; 4];
-    let mut spec_short: Vec<f32> = Vec::new();
-    let mut spec_long: Vec<f32> = Vec::new();
-    let mut spec_prev: Vec<f32> = Vec::new();
-    let mut spec_levels: Vec<f32> = Vec::new();
-    let mut spec_beat_env: Vec<f32> = Vec::new();
-    let mut spec_hold: Vec<f32> = Vec::new();
     let mut wave_phase = 0.0f32;
     let mut ramp_phase = 0.0f32;
     let mut tint_state: Vec<[f32; 3]> = Vec::new();
@@ -288,7 +342,20 @@ pub fn play(manager: &mut Inner, profile: &Profile) {
     let mut vu_hold = 0.0f32;
     let mut vu_peak = 0.0f32;
     let mut tempo_phase = 0.0f32;
+    let mut scope_hold: Vec<f32> = Vec::new();
+    let mut scope_peak = 0.002f32;
+    let mut spec_hist_e: Vec<f32> = Vec::new();
+    let mut spec_hist_h: Vec<f32> = Vec::new();
+    let mut spec_hist_bands = [[0.0f32; 4]; 4];
+    let mut stereo_l: Vec<f32> = Vec::new();
+    let mut stereo_r: Vec<f32> = Vec::new();
+    let mut pitch_hue = 210.0f32;
+    let mut pitch_hz = 0.0f32;
+    let mut key_hue = 200.0f32;
+    let mut liss_width = 0.12f32;
+    let mut bubbles: Vec<AudioBubble> = Vec::new();
     let mut color_ripples: Vec<ColorRipple> = Vec::new();
+    let mut column = ColumnFx::new();
     let mut prev_gate = [0.0f32; 4];
     let mut beat_env = [0.12f32; 4];
     let mut fast_env = 0.0f32;
@@ -297,9 +364,17 @@ pub fn play(manager: &mut Inner, profile: &Profile) {
     let mut drop_loud = 0.0f32;
     let mut drop_trough = 1.0f32;
     let mut shock_cool = 0.0f32;
+    let mut drop_flash_age = 1.0f32;
     let mut beats = BeatTracker::new();
+    let mut flux_beats = audio_beats::SuperFluxTracker::new();
+    let mut analyzer = audio_dsp::Analyzer::new(SAMPLE_RATE);
+    let mut studio = audio_dsp::Analyzer::studio(SAMPLE_RATE);
+    let mut mel_bank = audio_mel::MelBank::new();
+    let mut hpss = audio_hpss::Hpss::new();
+    let mut complex_on = audio_onset::ComplexOnset::new();
+    let mut davies = audio_tempo::DaviesTempo::new(SAMPLE_RATE, audio_dsp::HOP);
+    let mut auto_pick = audio_auto::AutoPicker::new();
     let mut last_tick = Instant::now();
-    let mut last_log = Instant::now();
     let mut last_vol_poll = Instant::now() - Duration::from_secs(1);
     let mut vol_gain = 1.0f32;
     let mut idle_mix = 1.0f32;
@@ -321,17 +396,93 @@ pub fn play(manager: &mut Inner, profile: &Profile) {
         let volume_dead = p.follow_system_volume && vol_gain <= 0.0;
         let beat_gates = matches!(p.style, AudioStyle::BeatGates);
         let n = manager.lamp_n();
-        let (frame, spec_frame, kick_raw, fast_rms) = {
+        let (mut frame, mut kick_raw, fast_rms, wave_snap, left_snap, right_snap, ring_snap, seq) = {
             let guard = samples.lock().unwrap();
+            let seq = capture_seq.load(Ordering::Relaxed);
             let rms = recent_rms(&guard);
-            if n > 4 {
-                let (spec, kick) = analyze_spectrum(&guard, SAMPLE_RATE, n);
-                ([0.0f32; 4], spec, kick, rms)
-            } else {
-                let (bands, kick) = analyze_bands(&guard, SAMPLE_RATE);
-                (bands, Vec::new(), kick, rms)
-            }
+            let classic_win = last_slice(&guard, FFT_SIZE);
+            let (left, right) = {
+                let lr = stereo.lock().unwrap();
+                (last_slice(&lr[0], FFT_SIZE), last_slice(&lr[1], FFT_SIZE))
+            };
+            let (bands, kick) = analyze_bands(&classic_win, SAMPLE_RATE);
+            (bands, kick, rms, classic_win, left, right, guard.clone(), seq)
         };
+
+        let classic_bands = frame;
+        let classic_kick = kick_raw;
+        let is_auto = matches!(p.analysis, AudioAnalysis::Auto);
+        let classic_forced = matches!(p.analysis, AudioAnalysis::Classic);
+        let mut dsp = audio_dsp::AnalysisFrame::default();
+        let mut mel_eq = [0.0f32; audio_dsp::EQ_BANDS];
+        let mut mel_b4 = [0.0f32; 4];
+        let mut hpss_fk = (0.0f32, 0.0f32);
+        let mut complex_fk = (0.0f32, 0.0f32);
+        let mut studio_frame = audio_dsp::AnalysisFrame::default();
+        let mut ran_studio = false;
+
+        if !classic_forced {
+            if is_auto {
+                dsp = analyzer.observe_seq(&ring_snap, seq);
+                let (eq, b4) = mel_bank.tick(analyzer.mag(), analyzer.sample_rate(), analyzer.fft_size());
+                mel_eq = eq;
+                mel_b4 = b4;
+                hpss_fk = hpss.tick(analyzer.mag(), analyzer.sample_rate(), analyzer.fft_size());
+                complex_fk = complex_on.tick(
+                    analyzer.re(),
+                    analyzer.im(),
+                    analyzer.sample_rate(),
+                    analyzer.fft_size(),
+                );
+                for &f in analyzer.hop_fluxes() {
+                    davies.tick(f);
+                }
+                let (bass_share, _) = eq24_stats(&dsp.eq24);
+                let bass_need = dsp.centroid < 0.18 && bass_share > 0.45;
+                if matches!(auto_pick.current(), AudioAnalysis::Studio) || bass_need {
+                    studio_frame = studio.observe_seq(&ring_snap, seq);
+                    ran_studio = true;
+                }
+            } else if matches!(p.analysis, AudioAnalysis::Studio) {
+                dsp = studio.observe_seq(&ring_snap, seq);
+                studio_frame = dsp;
+                ran_studio = true;
+            } else {
+                dsp = analyzer.observe_seq(&ring_snap, seq);
+                match p.analysis {
+                    AudioAnalysis::Mel => {
+                        let (eq, b4) = mel_bank.tick(analyzer.mag(), analyzer.sample_rate(), analyzer.fft_size());
+                        dsp.eq24 = eq;
+                        dsp.bands4 = b4;
+                    }
+                    AudioAnalysis::Hpss => {
+                        let (p_flux, k_flux) = hpss.tick(analyzer.mag(), analyzer.sample_rate(), analyzer.fft_size());
+                        dsp.flux = p_flux;
+                        dsp.kick_flux = k_flux;
+                    }
+                    AudioAnalysis::Complex => {
+                        let (flux, k_flux) = complex_on.tick(
+                            analyzer.re(),
+                            analyzer.im(),
+                            analyzer.sample_rate(),
+                            analyzer.fft_size(),
+                        );
+                        dsp.flux = flux;
+                        dsp.kick_flux = k_flux;
+                    }
+                    AudioAnalysis::Tempo => {
+                        for &f in analyzer.hop_fluxes() {
+                            davies.tick(f);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !is_auto {
+                frame = dsp.bands4;
+                kick_raw = dsp.kick;
+            }
+        }
 
         // Quiet songs / low Windows volume still have a beat shape; only treat
         // near-digital-silence as empty. The old 0.008 peak floor made 5–20%
@@ -345,8 +496,91 @@ pub fn play(manager: &mut Inner, profile: &Profile) {
             fast_peak = ema_toward(fast_peak, fast_env, dt, drop_tau).max(noise_floor);
         }
         let loud = ((fast_env / fast_peak.max(noise_floor)) * (0.55 + p.sensitivity * 0.5)).clamp(0.0, 1.0);
-        let flux_fast = (loud - prev_loud).max(0.0);
+        let mut flux_fast = (loud - prev_loud).max(0.0);
         prev_loud = loud;
+
+        let gated_scout = volume_dead || fast_env < noise_floor * 1.6;
+        let resolved = if is_auto {
+            let (bass_share, band_spread) = eq24_stats(&dsp.eq24);
+            let kick_share = dsp.kick_flux / (dsp.flux + dsp.kick_flux + 1e-4);
+            auto_pick.tick(
+                dt,
+                &audio_auto::AutoFeatures {
+                    rms: fast_env,
+                    flux: dsp.flux,
+                    kick_share,
+                    flatness: dsp.flatness,
+                    centroid: dsp.centroid,
+                    bass_share,
+                    band_spread,
+                    perc_share: hpss.perc_share(),
+                    complex_kick: complex_fk.1,
+                    superflux_kick: dsp.kick_flux,
+                    tempo_locked: davies.locked(),
+                    tempo_strength: davies.strength(),
+                    lamp_n: n,
+                    style: p.style,
+                },
+                gated_scout,
+            )
+        } else if classic_forced {
+            AudioAnalysis::Classic
+        } else {
+            p.analysis
+        };
+        if is_auto {
+            match resolved {
+                AudioAnalysis::Classic if n == 4 => {
+                    frame = classic_bands;
+                    kick_raw = classic_kick;
+                }
+                AudioAnalysis::Mel => {
+                    dsp.eq24 = mel_eq;
+                    dsp.bands4 = mel_b4;
+                    frame = dsp.bands4;
+                    kick_raw = dsp.kick;
+                }
+                AudioAnalysis::Studio => {
+                    if ran_studio {
+                        dsp = studio_frame;
+                    }
+                    frame = dsp.bands4;
+                    kick_raw = dsp.kick;
+                }
+                AudioAnalysis::Hpss => {
+                    dsp.flux = hpss_fk.0;
+                    dsp.kick_flux = hpss_fk.1;
+                    frame = dsp.bands4;
+                    kick_raw = dsp.kick;
+                }
+                AudioAnalysis::Complex => {
+                    dsp.flux = complex_fk.0;
+                    dsp.kick_flux = complex_fk.1;
+                    frame = dsp.bands4;
+                    kick_raw = dsp.kick;
+                }
+                _ => {
+                    frame = dsp.bands4;
+                    kick_raw = dsp.kick;
+                }
+            }
+        }
+        if let Ok(mut live) = params.lock() {
+            live.auto_resolved = resolved;
+        }
+        let engine = if is_auto { resolved } else { p.analysis };
+        let classic = classic_forced || (is_auto && matches!(engine, AudioAnalysis::Classic) && n == 4);
+        if !classic {
+            flux_fast = dsp.flux * (0.45 + p.punch * 0.25) + flux_fast * 0.35;
+        }
+        let beats_bias = matches!(
+            engine,
+            AudioAnalysis::Beats | AudioAnalysis::Complex | AudioAnalysis::Hpss
+        );
+        let spectrum_feel = matches!(
+            engine,
+            AudioAnalysis::Spectrum | AudioAnalysis::Mel | AudioAnalysis::Studio
+        );
 
         let boosted = [
             frame[0] * p.bass,
@@ -366,38 +600,19 @@ pub fn play(manager: &mut Inner, profile: &Profile) {
         } else {
             0.012 + p.smoothness * 0.014
         };
-        let long_tau = 0.55;
-        let attack_tau = 0.008 + p.smoothness * 0.012;
-        let release_tau = 0.035 + p.smoothness * 0.14;
+        let long_tau = if spectrum_feel { 0.85 } else { 0.55 };
+        let attack_tau = if beats_bias {
+            0.006 + p.smoothness * 0.008
+        } else {
+            0.008 + p.smoothness * 0.012
+        };
+        let release_tau = if spectrum_feel {
+            0.06 + p.smoothness * 0.18
+        } else {
+            0.035 + p.smoothness * 0.14
+        };
 
-        if n > 4 {
-            resize_spec(&mut spec_short, n, 0.0);
-            resize_spec(&mut spec_long, n, 0.02);
-            resize_spec(&mut spec_prev, n, 0.0);
-            resize_spec(&mut spec_levels, n, 0.0);
-            resize_spec(&mut spec_beat_env, n, 0.12);
-            resize_spec(&mut spec_hold, n, 0.0);
-            follow_spectrum(
-                &spec_frame,
-                &mut spec_short,
-                &mut spec_long,
-                &mut spec_prev,
-                &mut spec_levels,
-                &mut spec_beat_env,
-                &mut spec_hold,
-                &p,
-                beat_gates,
-                gated,
-                dt,
-                short_tau,
-                long_tau,
-                attack_tau,
-                release_tau,
-                env_floor,
-                loud,
-                flux_fast,
-            );
-        } else if beat_gates {
+        if beat_gates {
             let mut band = [0.0f32; 4];
             let mut band_flux = [0.0f32; 4];
             for i in 0..4 {
@@ -437,12 +652,17 @@ pub fn play(manager: &mut Inner, profile: &Profile) {
                 long_avg[i] = ema_toward(long_avg[i], raw.max(env_floor), dt, long_tau).max(env_floor);
                 let shape = short_avg[i] / long_avg[i];
                 let band = (shape / (shape + 0.7)).clamp(0.0, 1.0);
-                let flux = ((short_avg[i] - prev_short[i]).max(0.0) / long_avg[i]) + flux_fast;
+                let flux = if spectrum_feel {
+                    0.0
+                } else {
+                    ((short_avg[i] - prev_short[i]).max(0.0) / long_avg[i]) + flux_fast
+                };
                 prev_short[i] = short_avg[i];
+                let punch_amt = if spectrum_feel { 0.0 } else { flux * p.punch * 0.9 };
                 let target = if gated {
                     0.0
                 } else {
-                    (loud * (0.28 + 0.72 * band) + flux * p.punch * 0.9).clamp(0.0, 1.0)
+                    (loud * (0.28 + 0.72 * band) + punch_amt).clamp(0.0, 1.0)
                 };
                 let tau = if target > levels[i] { attack_tau } else { release_tau };
                 levels[i] = ema_toward(levels[i], target, dt, tau);
@@ -462,23 +682,32 @@ pub fn play(manager: &mut Inner, profile: &Profile) {
             drop_trough = ema_toward(drop_trough, drop_loud.min(loud), dt, 1.05);
         }
         shock_cool = (shock_cool - dt).max(0.0);
-        let bass_now = if n > 4 {
-            spec_levels.iter().take((n / 5).max(1)).copied().fold(0.0f32, f32::max)
-        } else {
-            levels[0]
-        };
-        let band_peak = if n > 4 {
-            spec_levels.iter().copied().fold(0.0f32, f32::max)
-        } else {
-            levels.iter().copied().fold(0.0f32, f32::max)
-        };
+        let bass_now = levels[0];
+        let band_peak = levels.iter().copied().fold(0.0f32, f32::max);
         let rise = (loud - drop_trough).max(0.0);
         let kick_now = (kick_raw * p.bass).clamp(0.0, 2.5);
-        let hits = if p.ripple_color && !volume_dead {
-            beats.tick(dt, gated, flux_fast, bass_now, kick_now, band_peak, p.punch, p.squelch)
+        let hits = if !volume_dead {
+            if classic {
+                beats.tick(dt, gated, flux_fast, bass_now, kick_now, band_peak, p.punch, p.squelch)
+            } else {
+                flux_beats.tick(
+                    dt,
+                    gated,
+                    dsp.flux,
+                    dsp.kick_flux,
+                    bass_now,
+                    kick_now,
+                    band_peak,
+                    p.punch,
+                    p.squelch,
+                    beats_bias,
+                )
+            }
         } else {
             beats.reset();
-            BeatHits::none()
+            flux_beats.reset();
+            davies.reset();
+            audio_beats::BeatHits::none()
         };
         let drop_hit = if p.ripple_color && p.ripple_shockwave && (hits.kick || hits.bass) && shock_cool <= 0.0 {
             let sens = p.ripple_shock_sensitivity;
@@ -491,39 +720,158 @@ pub fn play(manager: &mut Inner, profile: &Profile) {
             shock_cool = 0.5;
             drop_trough = (drop_loud * 0.85 + loud * 0.15).min(loud);
         }
-        let ring_hit = match p.ripple_trigger {
-            RippleTrigger::All => hits.any,
-            RippleTrigger::Bass => hits.bass,
-            RippleTrigger::Kick => hits.kick,
-            RippleTrigger::TripleKick => hits.triple,
+        let ring_hit = p.ripple_color
+            && match p.ripple_trigger {
+                RippleTrigger::All => hits.any,
+                RippleTrigger::Bass => hits.bass,
+                RippleTrigger::Kick => hits.kick,
+                RippleTrigger::TripleKick => hits.triple,
+            };
+        drop_flash_age = if hits.kick || hits.triple || drop_hit {
+            0.0
+        } else {
+            (drop_flash_age + dt).min(4.0)
         };
+        let (ibi, locked) = if classic {
+            (beats.ibi(), beats.tempo_locked())
+        } else if matches!(engine, AudioAnalysis::Tempo) || davies.locked() {
+            (davies.ibi(), davies.locked())
+        } else {
+            (flux_beats.ibi(), flux_beats.tempo_locked())
+        };
+        if let Ok(mut live) = params.lock() {
+            live.bpm = audio_flow::bpm_from_ibi(ibi, locked);
+            live.bpm_locked = locked;
+            live.drop = !volume_dead && drop_flash_age < 0.25;
+        }
         ramp_phase = (ramp_phase + dt * (0.12 + p.motion * 0.55)) % (2.0 * std::f32::consts::PI);
         if tint_state.len() != n {
             tint_state.resize(n, [0.0; 3]);
         }
 
-        let level_slice: &[f32] = if n > 4 { &spec_levels } else { &levels };
+        if matches!(p.style, AudioStyle::Stereo) {
+            follow_stereo(
+                &left_snap,
+                &right_snap,
+                n,
+                dt,
+                attack_tau,
+                release_tau,
+                p.contrast,
+                &mut stereo_l,
+                &mut stereo_r,
+            );
+        }
+        if matches!(p.style, AudioStyle::Pitch) {
+            follow_pitch(&wave_snap, dt, &mut pitch_hz, &mut pitch_hue);
+        }
+        if matches!(p.style, AudioStyle::KeyColor) {
+            follow_key(&wave_snap, dt, &mut key_hue);
+        }
+        if matches!(p.style, AudioStyle::Lissajous) {
+            let target = stereo_width(&left_snap, &right_snap);
+            liss_width = ema_toward(liss_width, target, dt, 0.09);
+        }
+        if matches!(p.style, AudioStyle::MidSide) {
+            follow_midside(&left_snap, &right_snap, dt, attack_tau, release_tau, &mut stereo_l);
+        }
+        if matches!(p.style, AudioStyle::Bubbles) {
+            if sparkle_lamps.len() != n {
+                sparkle_lamps.resize(n, 0.0);
+            }
+            tick_audio_bubbles(
+                &mut bubbles,
+                &mut sparkle_lamps,
+                n,
+                dt,
+                flux_fast,
+                loud,
+                levels[0],
+                p.punch,
+                p.motion,
+                &mut rng,
+            );
+        }
+
+        if matches!(p.style, AudioStyle::Eq24 | AudioStyle::Wavelength | AudioStyle::Melt) {
+            let mut raw = if classic {
+                analyze_eq24(&wave_snap, SAMPLE_RATE)
+            } else {
+                dsp.eq24
+            };
+            if classic {
+                blur_neighbors(&mut raw);
+            }
+            if column.eq.len() != n {
+                column.eq = vec![0.0; n];
+            }
+            let tau = 0.045 + p.smoothness * 0.14;
+            for i in 0..n {
+                let t = lamps::pos(i, n);
+                let src = t * (raw.len().saturating_sub(1) as f32);
+                let lo = src.floor() as usize;
+                let hi = (lo + 1).min(raw.len() - 1);
+                let f = src - lo as f32;
+                let target = raw[lo] * (1.0 - f) + raw[hi] * f;
+                column.eq[i] = ema_toward(column.eq[i], target, dt, tau);
+            }
+            blur_neighbors(&mut column.eq);
+        }
+        if matches!(p.style, AudioStyle::PanNeedle) {
+            let (l, r) = stereo_gains(&left_snap, &right_snap, p.contrast);
+            let target = if l + r < 1e-4 { 0.5 } else { r / (l + r) };
+            column.pan = ema_toward(column.pan, target.clamp(0.0, 1.0), dt, 0.07);
+        }
+        column.centroid = if classic {
+            spectral_centroid(&levels)
+        } else {
+            dsp.centroid
+        };
+
         let rgb = if volume_dead {
             sparkle = [0.0; 4];
             sparkle_lamps.fill(0.0);
             levels = [0.0; 4];
-            spec_levels.fill(0.0);
-            spec_hold.fill(0.0);
             strobe = 0.0;
             vu_hold = 0.0;
             vu_peak = 0.0;
             tempo_phase = 0.0;
+            scope_hold.fill(0.0);
+            spec_hist_e.fill(0.0);
+            spec_hist_h.fill(0.0);
+            spec_hist_bands = [[0.0; 4]; 4];
+            stereo_l.fill(0.0);
+            stereo_r.fill(0.0);
+            bubbles.clear();
+            sparkle_lamps.fill(0.0);
             color_ripples.clear();
+            column.reset();
             idle_mix = 1.0;
             drop_trough = 1.0;
             drop_loud = 0.0;
             shock_cool = 0.0;
+            drop_flash_age = 1.0;
             beats.reset();
+            flux_beats.reset();
+            davies.reset();
+            auto_pick.reset();
+            if let Ok(mut live) = params.lock() {
+                live.bpm = 0;
+                live.bpm_locked = false;
+                live.drop = false;
+            }
             vec![[0u8; 3]; n]
         } else {
+            let (ibi, locked) = if classic {
+                (beats.ibi(), beats.tempo_locked())
+            } else if matches!(engine, AudioAnalysis::Tempo) || davies.locked() {
+                (davies.ibi(), davies.locked())
+            } else {
+                (flux_beats.ibi(), flux_beats.tempo_locked())
+            };
             render_audio(
                 p,
-                level_slice,
+                &levels,
                 idle_mix,
                 flux_fast,
                 &mut wave_phase,
@@ -536,67 +884,34 @@ pub fn play(manager: &mut Inner, profile: &Profile) {
                 &mut vu_hold,
                 &mut vu_peak,
                 &mut tempo_phase,
+                &wave_snap,
+                &mut scope_hold,
+                &mut scope_peak,
+                &mut spec_hist_e,
+                &mut spec_hist_h,
+                &mut spec_hist_bands,
+                &stereo_l,
+                &stereo_r,
                 &mut color_ripples,
                 &mut prev_gate,
                 dt,
                 n,
                 drop_hit,
                 ring_hit,
-                beats.ibi(),
-                beats.tempo_locked(),
+                ibi,
+                locked,
+                if matches!(p.style, AudioStyle::KeyColor) { key_hue } else { pitch_hue },
+                liss_width,
                 &mut rng,
+                &mut column,
             )
         };
         manager.paint_lamps(&rgb);
-
-        if last_log.elapsed() > Duration::from_secs(3) {
-            let (b0, b1, b2, b3) = if n > 4 && spec_levels.len() == n {
-                (
-                    spec_levels[0],
-                    spec_levels[n / 4],
-                    spec_levels[n / 2],
-                    spec_levels[n - 1],
-                )
-            } else {
-                (levels[0], levels[1], levels[2], levels[3])
-            };
-            legion_rgb_driver::debug_log(&format!(
-                "AUDIO: capture={} loud={:.2} bass={:.2} mid={:.2} treble={:.2} presence={:.2} vol={:.2} follow={} lamps={}",
-                capture_ok.load(Ordering::Relaxed),
-                loud,
-                b0,
-                b1,
-                b2,
-                b3,
-                vol_gain,
-                p.follow_system_volume,
-                n
-            ));
-            last_log = Instant::now();
-        }
 
         thread::sleep(Duration::from_millis(if n > 4 { 33 } else { 8 }));
     }
 
     let _ = capture.join();
-}
-
-struct BeatHits {
-    any: bool,
-    bass: bool,
-    kick: bool,
-    triple: bool,
-}
-
-impl BeatHits {
-    fn none() -> Self {
-        Self {
-            any: false,
-            bass: false,
-            kick: false,
-            triple: false,
-        }
-    }
 }
 
 struct BeatTracker {
@@ -650,7 +965,7 @@ impl BeatTracker {
         peak: f32,
         punch: f32,
         squelch: f32,
-    ) -> BeatHits {
+    ) -> audio_beats::BeatHits {
         self.since = (self.since + dt).min(4.0);
         self.cool = (self.cool - dt).max(0.0);
         for age in &mut self.kick_age {
@@ -658,7 +973,7 @@ impl BeatTracker {
         }
         if gated {
             self.onset_p = 0.0;
-            return BeatHits::none();
+            return audio_beats::BeatHits::none();
         }
 
         let onset = flux.max(0.0);
@@ -677,7 +992,7 @@ impl BeatTracker {
         let hit = ready && (crossed || strong) && onset > 0.016;
         self.onset_p = onset;
 
-        let mut hits = BeatHits::none();
+        let mut hits = audio_beats::BeatHits::none();
         if hit {
             hits.any = true;
             hits.bass = bass_share >= 0.38 && (bass > 0.11 || bass_jump > 0.04);
@@ -777,6 +1092,40 @@ fn system_output_gain() -> f32 {
     }
 }
 
+fn eq24_stats(eq: &[f32; audio_dsp::EQ_BANDS]) -> (f32, f32) {
+    let mut sum = 0.0f32;
+    let mut low = 0.0f32;
+    for (i, v) in eq.iter().enumerate() {
+        sum += *v;
+        if i < 3 {
+            low += *v;
+        }
+    }
+    let mean = sum / audio_dsp::EQ_BANDS as f32;
+    let mut var = 0.0f32;
+    for v in eq {
+        let d = *v - mean;
+        var += d * d;
+    }
+    let spread = (var / audio_dsp::EQ_BANDS as f32).sqrt();
+    let bass = if sum > 1e-6 { (low / sum).clamp(0.0, 1.0) } else { 0.0 };
+    (bass, spread.clamp(0.0, 1.0))
+}
+
+fn last_slice(samples: &[f32], n: usize) -> Vec<f32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if samples.len() >= n {
+        samples[samples.len() - n..].to_vec()
+    } else {
+        let mut out = vec![0.0f32; n];
+        let start = n - samples.len();
+        out[start..].copy_from_slice(samples);
+        out
+    }
+}
+
 fn recent_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -791,87 +1140,28 @@ fn led_curve(energy: f32, contrast: f32) -> f32 {
     energy.clamp(0.0, 1.0).powf(contrast.clamp(0.5, 2.2))
 }
 
-fn resize_spec(v: &mut Vec<f32>, n: usize, fill: f32) {
-    if v.len() != n {
-        v.resize(n, fill);
-    }
-}
-
-fn freq_gain(params: &AudioReactParams, t: f32) -> f32 {
-    lamps::sample_bands(&[params.bass, params.mid, params.treble, params.presence], t).max(0.0)
-}
-
-fn follow_spectrum(
-    frame: &[f32],
-    short: &mut [f32],
-    long: &mut [f32],
-    prev: &mut [f32],
-    levels: &mut [f32],
-    beat_env: &mut [f32],
-    hold: &mut [f32],
-    p: &AudioReactParams,
-    beat_gates: bool,
-    gated: bool,
-    dt: f32,
-    short_tau: f32,
-    long_tau: f32,
-    attack_tau: f32,
-    release_tau: f32,
-    env_floor: f32,
-    loud: f32,
-    flux_fast: f32,
-) {
-    let n = frame.len().min(short.len()).min(levels.len());
-    if n == 0 {
-        return;
-    }
-    let mut band = vec![0.0f32; n];
-    let mut band_flux = vec![0.0f32; n];
-    for i in 0..n {
-        let raw = frame[i].max(0.0) * freq_gain(p, lamps::pos(i, n));
-        short[i] = ema_toward(short[i], raw, dt, short_tau);
-        long[i] = ema_toward(long[i], raw.max(env_floor), dt, long_tau).max(env_floor);
-        let shape = short[i] / long[i];
-        band[i] = (shape / (shape + 0.7)).clamp(0.0, 1.0);
-        band_flux[i] = ((short[i] - prev[i]).max(0.0) / long[i]).clamp(0.0, 2.0);
-        prev[i] = short[i];
-    }
-    if beat_gates {
-        for i in 0..n {
-            beat_env[i] = ema_toward(beat_env[i], band[i], dt, 0.22).max(0.05);
-        }
-        let strongest = band
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let kick = flux_fast > (0.032 - p.punch * 0.01).max(0.016);
-        let hold_t = (0.065 + p.smoothness * 0.05).clamp(0.05, 0.14);
-        for i in 0..n {
-            let thresh = (beat_env[i] * 1.16 + 0.03 + p.squelch * 0.12).clamp(0.07, 0.5);
-            let local_hit = !gated && band[i] > thresh && band_flux[i] > 0.012;
-            let kick_hit = !gated && kick && i == strongest && band[i] > beat_env[i] * 0.72;
-            let hit = local_hit || kick_hit;
-            if hit && (hold[i] < 0.018 || band_flux[i] > 0.05 || kick_hit) {
-                hold[i] = hold_t;
-            } else {
-                hold[i] = (hold[i] - dt).max(0.0);
-            }
-            levels[i] = if hold[i] > 0.0 { 1.0 } else { 0.0 };
-        }
-    } else {
-        for i in 0..n {
-            let flux = band_flux[i] + flux_fast;
-            let target = if gated {
-                0.0
-            } else {
-                (loud * (0.28 + 0.72 * band[i]) + flux * p.punch * 0.9).clamp(0.0, 1.0)
-            };
-            let tau = if target > levels[i] { attack_tau } else { release_tau };
-            levels[i] = ema_toward(levels[i], target, dt, tau);
-        }
-    }
+fn skip_spatial_blur(style: AudioStyle) -> bool {
+    matches!(
+        style,
+        AudioStyle::BeatGates
+            | AudioStyle::Vu
+            | AudioStyle::TempoPulse
+            | AudioStyle::Oscilloscope
+            | AudioStyle::Spectrogram
+            | AudioStyle::Stereo
+            | AudioStyle::Pitch
+            | AudioStyle::Lissajous
+            | AudioStyle::Bubbles
+            | AudioStyle::KeyColor
+            | AudioStyle::MidSide
+            | AudioStyle::Eq24
+            | AudioStyle::PanNeedle
+            | AudioStyle::Collision
+            | AudioStyle::Snake
+            | AudioStyle::Gravcenter
+            | AudioStyle::Melt
+            | AudioStyle::Wavelength
+    )
 }
 
 fn render_audio(
@@ -889,6 +1179,14 @@ fn render_audio(
     vu_hold: &mut f32,
     vu_peak: &mut f32,
     tempo_phase: &mut f32,
+    wave: &[f32],
+    scope_hold: &mut Vec<f32>,
+    scope_peak: &mut f32,
+    spec_hist_e: &mut Vec<f32>,
+    spec_hist_h: &mut Vec<f32>,
+    _spec_hist_bands: &mut [[f32; 4]; 4],
+    left_levels: &[f32],
+    right_levels: &[f32],
     color_ripples: &mut Vec<ColorRipple>,
     _prev_gate: &mut [f32; 4],
     dt: f32,
@@ -897,7 +1195,10 @@ fn render_audio(
     ring_hit: bool,
     tempo_ibi: f32,
     tempo_locked: bool,
+    pitch_hue: f32,
+    liss_width: f32,
     rng: &mut impl rand::Rng,
+    column: &mut ColumnFx,
 ) -> Vec<[u8; 3]> {
     let n = lamp_count.max(1);
     if sparkle_lamps.len() != n {
@@ -907,68 +1208,44 @@ fn render_audio(
     let idle = params.idle_brightness as f32 / 100.0;
     let rest = idle_mix.clamp(0.0, 1.0);
     let motion = 0.35 + params.motion * 1.4;
-    let fine = n > 4 && levels.len() >= n;
+    let fine = n > 4;
     let four = to_four(levels);
-    let drive = if fine {
-        levels.iter().take((n / 4).max(1)).copied().fold(0.0f32, f32::max)
+    let four_s = if skip_spatial_blur(params.style) {
+        four
     } else {
-        four[0].max(four[1])
+        spatial_blur(&four, params.spread)
     };
-    let peak = levels.iter().copied().fold(0.0f32, f32::max);
+    let drive = four_s[0].max(four_s[1]);
+    let peak = four_s.iter().copied().fold(0.0f32, f32::max);
     *wave_phase = (*wave_phase + dt * (0.35 + motion * (0.6 + drive * 2.4))) % (2.0 * PI);
 
-    let mut energies = if fine {
-        levels[..n].to_vec()
-    } else if matches!(params.style, AudioStyle::BeatGates | AudioStyle::Vu | AudioStyle::TempoPulse) {
-        four.to_vec()
-    } else {
-        spatial_blur(&four, params.spread).to_vec()
-    };
-    if fine && !matches!(params.style, AudioStyle::BeatGates | AudioStyle::Vu | AudioStyle::TempoPulse) {
-        spatial_blur_n(&mut energies, params.spread);
-    }
+    let mut energies = expand_strips(&four_s, n);
 
     match params.style {
-        AudioStyle::Levels | AudioStyle::Wave | AudioStyle::Gradient | AudioStyle::Center => {}
-        AudioStyle::Mirror => {
-            if fine {
-                let orig = energies.clone();
-                for i in 0..n {
-                    let src = i.min(n - 1 - i);
-                    energies[i] = orig[src];
-                }
-            }
+        AudioStyle::Levels => {
+            energies = expand_meters(&four_s, n);
         }
-        AudioStyle::Pulse => {
-            let pulse = if fine {
-                let bass = energies.iter().take((n / 4).max(1)).copied().fold(0.0f32, f32::max);
-                (energies.iter().sum::<f32>() / n as f32).max(bass * 0.85)
-            } else {
-                (four.iter().sum::<f32>() / 4.0).max(four[0] * 0.85)
-            };
+        AudioStyle::Wave | AudioStyle::Gradient | AudioStyle::Center => {}
+        AudioStyle::Mirror => {}
+        AudioStyle::Pulse | AudioStyle::Pitch | AudioStyle::KeyColor => {
+            let pulse = (four_s.iter().sum::<f32>() / 4.0).max(four_s[0] * 0.85);
             energies.fill(pulse);
         }
         AudioStyle::Bloom => {
-            if fine {
-                cascade_bloom(&mut energies);
-            } else {
-                energies.resize(4, 0.0);
-                energies[0] = four[0];
-                energies[1] = four[1].max(four[0] * 0.62);
-                energies[2] = four[2].max(four[0] * 0.32 + four[1] * 0.45);
-                energies[3] = four[3].max(four[1] * 0.28 + four[2] * 0.40);
-            }
+            let mut col = [0.0f32; 4];
+            col[0] = four[0];
+            col[1] = four[1].max(four[0] * 0.62);
+            col[2] = four[2].max(four[0] * 0.32 + four[1] * 0.45);
+            col[3] = four[3].max(four[1] * 0.28 + four[2] * 0.40);
+            energies = expand_meters(&col, n);
         }
         AudioStyle::Fire => {
-            if fine {
-                cascade_fire(&mut energies);
-            } else {
-                energies.resize(4, 0.0);
-                energies[0] = four[0];
-                energies[1] = (four[0] * 0.75 + four[1] * 0.55).min(1.0);
-                energies[2] = (four[1] * 0.55 + four[2] * 0.7).min(1.0);
-                energies[3] = (four[2] * 0.4 + four[3] * 0.85).min(1.0);
-            }
+            let mut col = [0.0f32; 4];
+            col[0] = four[0];
+            col[1] = (four[0] * 0.75 + four[1] * 0.55).min(1.0);
+            col[2] = (four[1] * 0.55 + four[2] * 0.7).min(1.0);
+            col[3] = (four[2] * 0.4 + four[3] * 0.85).min(1.0);
+            energies = expand_meters(&col, n);
         }
         AudioStyle::Strobe => {
             *strobe *= (1.0 - dt * (12.0 + motion * 6.0)).max(0.0);
@@ -983,12 +1260,19 @@ fn render_audio(
                 *spark *= (1.0 - dt * (5.5 + motion * 3.0)).max(0.0);
             }
             if (peak > 0.18 || flux > 0.03) && rng.random::<f32>() < (0.1 + peak * 0.4 + params.punch * 0.1) {
-                let z = rng.random_range(0..n);
-                sparkle_lamps[z] = sparkle_lamps[z].max(0.55 + peak * 0.45);
+                let center = rng.random_range(0..n);
+                let amt = 0.55 + peak * 0.45;
+                for d in -1i32..=1 {
+                    let i = center as i32 + d;
+                    if i >= 0 && (i as usize) < n {
+                        let fall = if d == 0 { 1.0 } else { 0.42 };
+                        sparkle_lamps[i as usize] = sparkle_lamps[i as usize].max(amt * fall);
+                    }
+                }
             }
         }
         AudioStyle::Chase => {
-            *chase = (*chase + dt * (1.1 + motion * 3.8 + drive * 2.2) * n as f32 / 4.0) % n as f32;
+            *chase = (*chase + dt * (1.1 + motion * 3.8 + drive * 2.2)) % n.max(1) as f32;
         }
         AudioStyle::Vu => {
             if peak > *vu_hold {
@@ -1001,12 +1285,14 @@ fn render_audio(
             } else {
                 *vu_peak = ema_toward(*vu_peak, *vu_hold, dt, 0.55);
             }
-            let fill_x = vu_hold.clamp(0.0, 1.0) * n as f32;
-            let mark = (vu_peak.clamp(0.0, 1.0) * (n as f32 - 1.0)).round();
+            let cols = n.max(1) as f32;
+            let fill_x = vu_hold.clamp(0.0, 1.0) * cols;
+            let mark = (vu_peak.clamp(0.0, 1.0) * (cols - 1.0).max(0.0)).round();
             energies.resize(n, 0.0);
             for i in 0..n {
-                let bar = (fill_x - i as f32).clamp(0.0, 1.0);
-                let tip = if (i as f32 - mark).abs() < 0.51 { 0.92 } else { 0.0 };
+                let col = i as f32;
+                let bar = (fill_x - col).clamp(0.0, 1.0);
+                let tip = if (col - mark).abs() < 0.51 { 0.92 } else { 0.0 };
                 energies[i] = bar.max(tip);
             }
         }
@@ -1019,13 +1305,120 @@ fn render_audio(
             let pulse = if tempo_locked {
                 let shape = (0.5 + 0.5 * (*tempo_phase * 2.0 * PI).cos()).powf(2.2);
                 (0.12 + 0.88 * shape).clamp(0.0, 1.0)
-            } else if fine {
-                let bass = energies.iter().take((n / 4).max(1)).copied().fold(0.0f32, f32::max);
-                (energies.iter().sum::<f32>() / n as f32).max(bass * 0.85)
             } else {
-                (four.iter().sum::<f32>() / 4.0).max(four[0] * 0.85)
+                (four_s.iter().sum::<f32>() / 4.0).max(four_s[0] * 0.85)
             };
             energies.resize(n, 0.0);
+            energies.fill(pulse);
+        }
+        AudioStyle::Oscilloscope => {
+            if scope_hold.len() != n {
+                scope_hold.resize(n, 0.0);
+            }
+            let inst = wave.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            if inst > *scope_peak {
+                *scope_peak = inst;
+            } else {
+                *scope_peak = ema_toward(*scope_peak, inst, dt, 0.28).max(1.5e-4);
+            }
+            let gain = (0.7 + params.sensitivity * 0.55) / scope_peak.max(1.5e-4);
+            let len = wave.len().max(1);
+            energies.resize(n, 0.0);
+            for c in 0..n {
+                let idx = if n <= 1 { 0 } else { c * (len - 1) / (n - 1) };
+                let v = (wave.get(idx).copied().unwrap_or(0.0).abs() * gain).clamp(0.0, 1.0);
+                if v > scope_hold[c] {
+                    scope_hold[c] = v;
+                } else {
+                    scope_hold[c] = ema_toward(scope_hold[c], v, dt, 0.05);
+                }
+                energies[c] = scope_hold[c];
+            }
+        }
+        AudioStyle::Spectrogram => {
+            if spec_hist_e.len() != n {
+                spec_hist_e.resize(n, 0.0);
+                spec_hist_h.resize(n, 0.5);
+            }
+            if n > 0 {
+                spec_hist_e.copy_within(0..n.saturating_sub(1), 1);
+                spec_hist_h.copy_within(0..n.saturating_sub(1), 1);
+                spec_hist_e[0] = peak.max(drive);
+                spec_hist_h[0] = spectral_centroid(&four_s);
+            }
+            energies = spec_hist_e.clone();
+        }
+        AudioStyle::Stereo => {
+            energies.resize(n, 0.0);
+            layout_stereo(&mut energies, left_levels, right_levels, levels);
+        }
+        AudioStyle::MidSide => {
+            energies.resize(n, 0.0);
+            layout_midside(&mut energies, left_levels);
+        }
+        AudioStyle::Eq24 => {
+            if column.eq.len() == n {
+                energies = column.eq.clone();
+            } else {
+                energies = expand_strips(&four_s, n);
+            }
+        }
+        AudioStyle::PanNeedle => {
+            energies = vec![0.0; n];
+            let sigma = if n > 4 { 0.9 } else { 0.55 };
+            stamp_gauss(&mut energies, column.pan, sigma);
+            let loud = peak.max(drive);
+            for slot in energies.iter_mut() {
+                *slot *= 0.12 + 0.88 * loud;
+            }
+        }
+        AudioStyle::Collision => {
+            tick_collision(column, n, dt, flux, peak, drive, params.motion, sparkle_lamps);
+            energies = vec![0.0; n];
+            if column.clash_on {
+                let sigma = if n > 4 { 0.7 } else { 0.45 };
+                stamp_gauss(&mut energies, column.clash_l, sigma);
+                stamp_gauss(&mut energies, column.clash_r, sigma);
+            }
+            if column.clash_flash > 0.02 {
+                stamp_gauss(&mut energies, column.clash_x, if n > 4 { 1.4 } else { 0.7 });
+                for slot in energies.iter_mut() {
+                    *slot = (*slot + column.clash_flash * 0.55).min(1.0);
+                }
+            }
+            for i in 0..n {
+                energies[i] = (energies[i] + sparkle_lamps.get(i).copied().unwrap_or(0.0)).clamp(0.0, 1.0);
+            }
+        }
+        AudioStyle::Snake => {
+            energies = vec![0.0; n];
+            tick_snake(column, &mut energies, n, dt, flux, peak, drive, params.motion, ring_hit);
+        }
+        AudioStyle::Gravcenter => {
+            audio_flow::tick_grav(&mut column.grav_h, peak.max(drive), dt, params.smoothness);
+            energies = audio_flow::grav_map(n, column.grav_h, *wave_phase);
+        }
+        AudioStyle::Melt => {
+            let inject = if column.eq.len() == n {
+                column.eq.clone()
+            } else {
+                expand_strips(&four_s, n)
+            };
+            audio_flow::tick_melt(&mut column.melt, &inject, dt, params.smoothness);
+            energies = column.melt.clone();
+        }
+        AudioStyle::Wavelength => {
+            audio_flow::tick_wavelength(&mut column.wave_scroll, dt, params.motion);
+            let bands: Vec<f32> = if column.eq.len() == n {
+                column.eq.clone()
+            } else {
+                expand_strips(&four_s, n)
+            };
+            energies = audio_flow::wavelength_energy(n, &bands, column.wave_scroll);
+        }
+        AudioStyle::Bubbles => {}
+        AudioStyle::Lissajous => {
+            let pulse = (four_s.iter().sum::<f32>() / 4.0).max(peak);
             energies.fill(pulse);
         }
         AudioStyle::BeatGates | AudioStyle::Ripple => {}
@@ -1053,7 +1446,6 @@ fn render_audio(
         color_ripples.clear();
     }
 
-    let zone_w = (n as f32 / 4.0).max(1.0);
     let four_e = to_four(&energies);
     (0..n)
         .map(|i| {
@@ -1071,10 +1463,21 @@ fn render_audio(
                         hard_band(&four_e, i, n)
                     }
                 }
-                AudioStyle::Pulse | AudioStyle::Strobe | AudioStyle::TempoPulse => {
+                AudioStyle::Pulse | AudioStyle::Strobe | AudioStyle::TempoPulse | AudioStyle::Pitch | AudioStyle::KeyColor => {
                     energies.first().copied().unwrap_or(0.0)
                 }
-                AudioStyle::Vu => {
+                AudioStyle::Vu
+                | AudioStyle::Oscilloscope
+                | AudioStyle::Spectrogram
+                | AudioStyle::Stereo
+                | AudioStyle::MidSide
+                | AudioStyle::Eq24
+                | AudioStyle::PanNeedle
+                | AudioStyle::Collision
+                | AudioStyle::Snake
+                | AudioStyle::Gravcenter
+                | AudioStyle::Melt
+                | AudioStyle::Wavelength => {
                     if fine {
                         local
                     } else {
@@ -1083,13 +1486,16 @@ fn render_audio(
                 }
                 AudioStyle::Wave => {
                     let travel = 0.5 + 0.5 * ((*wave_phase) - t * 2.0 * PI).sin();
+                    (local * 0.28 + travel * drive.max(peak) * 0.78).clamp(0.0, 1.0)
+                }
+                AudioStyle::Bloom => {
                     if fine {
-                        (local * 0.28 + travel * drive.max(peak) * 0.78 * (0.4 + 0.6 * local)).clamp(0.0, 1.0)
+                        local
                     } else {
-                        (local * 0.28 + travel * drive.max(peak) * 0.78).clamp(0.0, 1.0)
+                        lamps::sample_bands(&four_e, t)
                     }
                 }
-                AudioStyle::Bloom | AudioStyle::Fire => {
+                AudioStyle::Fire => {
                     if fine {
                         local
                     } else {
@@ -1106,41 +1512,32 @@ fn render_audio(
                         geo
                     }
                 }
+                AudioStyle::Lissajous => {
+                    let loud = energies.first().copied().unwrap_or(0.0).max(peak);
+                    let dist = (t - 0.5).abs() * 2.0;
+                    let sigma = (0.11 + liss_width * 0.86).clamp(0.10, 0.98);
+                    let geo = ((1.0 - dist / sigma).max(0.0).powf(1.28)).clamp(0.0, 1.0);
+                    (geo * (0.08 + 0.92 * loud)).clamp(0.0, 1.0)
+                }
                 AudioStyle::Mirror => {
-                    if fine {
-                        local
-                    } else {
-                        let half = (n / 2).max(2);
-                        let src = i.min(n - 1 - i);
-                        let t_src = lamps::pos(src, half) * 0.5;
-                        lamps::sample_bands(&four_e, t_src)
-                    }
+                    let half = (n / 2).max(2);
+                    let src = i.min(n - 1 - i);
+                    let t_src = lamps::pos(src, half) * 0.5;
+                    lamps::sample_bands(&four_e, t_src)
                 }
                 AudioStyle::Sparkle => (local * 0.28 + sparkle_lamps[i]).clamp(0.0, 1.0),
+                AudioStyle::Bubbles => {
+                    let loud = energies.first().copied().unwrap_or(0.0).max(peak);
+                    (sparkle_lamps.get(i).copied().unwrap_or(0.0) * (0.2 + 0.8 * loud)).clamp(0.0, 1.0)
+                }
                 AudioStyle::Chase => {
                     let dist = (i as f32 - *chase).abs().min(n as f32 - (i as f32 - *chase).abs());
-                    let sigma = (zone_w * 0.55).max(0.5);
+                    let sigma = if n > 4 { 1.15f32 } else { 0.55f32 };
                     let spot = (-dist * dist / (2.0 * sigma * sigma)).exp();
-                    let base = (spot * (0.2 + drive.max(peak) * 0.9)).clamp(0.0, 1.0);
-                    if fine {
-                        (base * (0.45 + 0.55 * local)).clamp(0.0, 1.0)
-                    } else {
-                        base
-                    }
+                    (spot * (0.2 + drive.max(peak) * 0.9)).clamp(0.0, 1.0)
                 }
                 AudioStyle::Gradient => {
-                    let g = if fine {
-                        let mut acc = 0.0;
-                        let mut w = 0.0;
-                        for (idx, v) in levels.iter().take(n).enumerate() {
-                            let wt = 1.0 - lamps::pos(idx, n) * 0.5;
-                            acc += *v * wt;
-                            w += wt;
-                        }
-                        (acc / w.max(1e-3)).clamp(0.0, 1.0)
-                    } else {
-                        (four[0] * 0.45 + four[1] * 0.3 + four[2] * 0.15 + four[3] * 0.1).clamp(0.0, 1.0)
-                    };
+                    let g = (four[0] * 0.45 + four[1] * 0.3 + four[2] * 0.15 + four[3] * 0.1).clamp(0.0, 1.0);
                     let bump = (0.12 + (1.0 - (t - g).abs()) * (0.45 + peak * 0.55)).clamp(0.0, 1.0);
                     if fine {
                         (bump * (0.4 + 0.6 * local)).clamp(0.0, 1.0)
@@ -1162,7 +1559,10 @@ fn render_audio(
                 0.0
             };
             let energy = (energy + ring * params.ripple_strength).clamp(0.0, 1.0);
-            let beat_amt = if matches!(params.style, AudioStyle::BeatGates | AudioStyle::Strobe) {
+            let beat_amt = if matches!(
+                params.style,
+                AudioStyle::BeatGates | AudioStyle::Strobe | AudioStyle::Stereo | AudioStyle::MidSide | AudioStyle::Bubbles | AudioStyle::Collision
+            ) {
                 energy.clamp(0.0, 1.0)
             } else {
                 (beat_floor + (1.0 - beat_floor) * led_curve(energy, params.contrast)).clamp(0.0, 1.0)
@@ -1177,13 +1577,30 @@ fn render_audio(
                 motion: params.motion,
             };
             let mut rgb = audio_color::tint(params.color_mode, ctx);
+            if matches!(params.style, AudioStyle::Pitch | AudioStyle::KeyColor) {
+                let (pr, pg, pb) = audio_color::hsv_to_rgb(pitch_hue.rem_euclid(360.0), 0.88, 1.0);
+                rgb = [pr, pg, pb];
+            }
+            if matches!(params.style, AudioStyle::Wavelength) {
+                let hue = audio_flow::wavelength_hue(t, column.wave_scroll, column.centroid);
+                let (pr, pg, pb) = audio_color::hsv_to_rgb(hue, 0.92, 1.0);
+                rgb = [pr, pg, pb];
+            }
             if matches!(params.style, AudioStyle::Fire) {
                 rgb = lamps::mix_rgb(fire_color(t), rgb, 0.32);
             }
             let (mut r, mut g, mut b) = (rgb[0], rgb[1], rgb[2]);
-            if params.hue_shift > 0.01
+            if matches!(params.style, AudioStyle::Spectrogram) {
+                let centroid = spec_hist_h.get(lamp_col(i, n)).copied().unwrap_or(0.5);
+                let hue_add = centroid * 70.0 + params.hue_shift * centroid * 40.0;
+                let (h, s, v) = audio_color::rgb_to_hsv(r, g, b);
+                (r, g, b) = audio_color::hsv_to_rgb((h + hue_add).rem_euclid(360.0), s.max(0.45), v);
+            } else if params.hue_shift > 0.01
                 && audio_color::hue_shift_ok(params.color_mode)
-                && !matches!(params.style, AudioStyle::Fire)
+                && !matches!(
+                    params.style,
+                    AudioStyle::Fire | AudioStyle::Pitch | AudioStyle::KeyColor | AudioStyle::Wavelength
+                )
             {
                 let hue_add = energy * params.hue_shift * 90.0 + *wave_phase * params.hue_shift * 12.0;
                 let (h, s, v) = audio_color::rgb_to_hsv(r, g, b);
@@ -1216,16 +1633,471 @@ fn render_audio(
 }
 
 fn to_four(levels: &[f32]) -> [f32; 4] {
-    [
-        levels.first().copied().unwrap_or(0.0),
-        levels.get(1).copied().unwrap_or(0.0),
-        levels.get(2).copied().unwrap_or(0.0),
-        levels.get(3).copied().unwrap_or(0.0),
-    ]
+    let n = levels.len();
+    if n <= 4 {
+        [
+            levels.first().copied().unwrap_or(0.0),
+            levels.get(1).copied().unwrap_or(0.0),
+            levels.get(2).copied().unwrap_or(0.0),
+            levels.get(3).copied().unwrap_or(0.0),
+        ]
+    } else {
+        let rows = (n / 4).max(1);
+        [
+            levels.first().copied().unwrap_or(0.0),
+            levels.get(rows).copied().unwrap_or(0.0),
+            levels.get(rows * 2).copied().unwrap_or(0.0),
+            levels.get(rows * 3).copied().unwrap_or(0.0),
+        ]
+    }
+}
+
+fn strip_count(n: usize) -> usize {
+    n.max(1)
+}
+
+fn lamp_col(i: usize, n: usize) -> usize {
+    i.min(n.saturating_sub(1))
+}
+
+fn meter_cell(energy: f32, row: usize, rows: usize) -> f32 {
+    let e = energy.clamp(0.0, 1.0);
+    if rows <= 1 {
+        return e;
+    }
+    let y0 = row as f32 / rows as f32;
+    let y1 = (row + 1) as f32 / rows as f32;
+    if e >= y1 {
+        1.0
+    } else if e <= y0 {
+        0.0
+    } else {
+        ((e - y0) / (y1 - y0).max(1e-4)).clamp(0.0, 1.0)
+    }
+}
+
+fn expand_strips(four: &[f32], n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| four.get((i * 4 / n.max(1)).min(3)).copied().unwrap_or(0.0))
+        .collect()
+}
+
+fn expand_meters(four: &[f32], n: usize) -> Vec<f32> {
+    if n <= 4 {
+        return expand_strips(four, n);
+    }
+    let width = (n / 4).max(1);
+    let mut out = vec![0.0; n];
+    for z in 0..4 {
+        let e = four.get(z).copied().unwrap_or(0.0);
+        for k in 0..width {
+            let i = z * width + k;
+            if i < n {
+                out[i] = meter_cell(e, k, width);
+            }
+        }
+    }
+    out
 }
 
 fn hard_band(levels: &[f32; 4], i: usize, n: usize) -> f32 {
     levels[(i * 4 / n.max(1)).min(3)]
+}
+
+fn spectral_centroid(levels: &[f32]) -> f32 {
+    let mut wsum = 0.0;
+    let mut sum = 0.0;
+    for (i, v) in levels.iter().enumerate() {
+        let e = v.max(0.0);
+        wsum += e * (i as f32 + 0.5);
+        sum += e;
+    }
+    if sum < 1e-6 || levels.is_empty() {
+        0.5
+    } else {
+        (wsum / sum) / levels.len() as f32
+    }
+}
+
+fn layout_stereo(out: &mut [f32], left: &[f32], right: &[f32], fallback: &[f32]) {
+    let n = out.len();
+    if n == 0 {
+        return;
+    }
+    let l = if left.len() >= 2 { left } else { fallback };
+    let r = if right.len() >= 2 { right } else { fallback };
+    let lf = to_four(l);
+    let rf = to_four(r);
+    // Left half / right half. Do not put bass on both outer edges — a centered
+    // kick would light far-left and far-right together and look un-split.
+    let cols = [
+        lf[0].max(lf[1] * 0.65),
+        lf[2].max(lf[3]),
+        rf[0].max(rf[1] * 0.65),
+        rf[2].max(rf[3]),
+    ];
+    for i in 0..n {
+        let z = (i * 4 / n.max(1)).min(3);
+        out[i] = cols[z];
+    }
+}
+
+fn stereo_gains(left: &[f32], right: &[f32], contrast: f32) -> (f32, f32) {
+    let n = FAST_WIN.min(left.len()).min(right.len());
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let sl = left.len() - n;
+    let sr = right.len() - n;
+    let width = (1.25 + (contrast - 1.0) * 1.4).clamp(1.25, 3.4);
+    let mut l_acc = 0.0f32;
+    let mut r_acc = 0.0f32;
+    for i in 0..n {
+        let l = left[sl + i];
+        let r = right[sr + i];
+        let mid = (l + r) * 0.5;
+        let side = (l - r) * 0.5;
+        let lw = mid + side * width;
+        let rw = mid - side * width;
+        l_acc += lw * lw;
+        r_acc += rw * rw;
+    }
+    let l_rms = (l_acc / n as f32).sqrt();
+    let r_rms = (r_acc / n as f32).sqrt();
+    let peak = l_rms.max(r_rms).max(1e-5);
+    let expand = (1.55 + contrast * 0.7).clamp(1.8, 3.8);
+    (
+        (l_rms / peak).powf(expand).clamp(0.0, 1.0),
+        (r_rms / peak).powf(expand).clamp(0.0, 1.0),
+    )
+}
+
+fn follow_stereo(
+    left: &[f32],
+    right: &[f32],
+    _n: usize,
+    dt: f32,
+    attack_tau: f32,
+    release_tau: f32,
+    contrast: f32,
+    stereo_l: &mut Vec<f32>,
+    stereo_r: &mut Vec<f32>,
+) {
+    let (l_raw, _) = analyze_bands(left, SAMPLE_RATE);
+    let (r_raw, _) = analyze_bands(right, SAMPLE_RATE);
+    let spec_peak = l_raw
+        .iter()
+        .copied()
+        .chain(r_raw.iter().copied())
+        .fold(0.0f32, f32::max)
+        .max(1e-5);
+    let (l_gain, r_gain) = stereo_gains(left, right, contrast);
+
+    if stereo_l.len() != 4 {
+        stereo_l.resize(4, 0.0);
+    }
+    if stereo_r.len() != 4 {
+        stereo_r.resize(4, 0.0);
+    }
+    for i in 0..4 {
+        let l_t = (l_raw[i] / spec_peak).clamp(0.0, 1.0) * l_gain;
+        let r_t = (r_raw[i] / spec_peak).clamp(0.0, 1.0) * r_gain;
+        let l_tau = if l_t > stereo_l[i] { attack_tau } else { release_tau };
+        let r_tau = if r_t > stereo_r[i] { attack_tau } else { release_tau };
+        stereo_l[i] = ema_toward(stereo_l[i], l_t, dt, l_tau);
+        stereo_r[i] = ema_toward(stereo_r[i], r_t, dt, r_tau);
+    }
+}
+
+fn lerp_hue(a: f32, b: f32, t: f32) -> f32 {
+    let mut d = (b - a).rem_euclid(360.0);
+    if d > 180.0 {
+        d -= 360.0;
+    }
+    (a + d * t.clamp(0.0, 1.0)).rem_euclid(360.0)
+}
+
+fn follow_pitch(samples: &[f32], dt: f32, pitch_hz: &mut f32, pitch_hue: &mut f32) {
+    if let Some((hz, conf)) = detect_pitch(samples) {
+        if conf > 2.2 {
+            let alpha = if *pitch_hz < 1.0 { 0.45 } else { (1.0 - (-dt / 0.08).exp()).clamp(0.08, 0.5) };
+            *pitch_hz = if *pitch_hz < 1.0 {
+                hz
+            } else {
+                *pitch_hz * (1.0 - alpha) + hz * alpha
+            };
+            let chroma = (*pitch_hz / 16.35159783).log2().rem_euclid(1.0);
+            *pitch_hue = lerp_hue(*pitch_hue, chroma * 360.0, 0.28);
+        }
+    }
+}
+
+fn detect_pitch(samples: &[f32]) -> Option<(f32, f32)> {
+    let (re, im) = compute_fft(samples)?;
+    let nyquist = FFT_SIZE / 2;
+    let bin_hz = SAMPLE_RATE as f32 / FFT_SIZE as f32;
+    let mut mag = [0.0f32; FFT_SIZE / 2];
+    let mut mag_sum = 0.0f32;
+    for i in 1..nyquist {
+        mag[i] = (re[i] * re[i] + im[i] * im[i]).sqrt();
+        mag_sum += mag[i];
+    }
+    let mag_mean = mag_sum / (nyquist.saturating_sub(1) as f32).max(1.0);
+    let i_lo = (70.0 / bin_hz).round().max(1.0) as usize;
+    let i_hi = (1000.0 / bin_hz).round().min((nyquist / 3 - 1) as f32) as usize;
+    if i_lo >= i_hi {
+        return None;
+    }
+    let mut best_i = i_lo;
+    let mut best_p = 0.0f32;
+    let mut hps_sum = 0.0f32;
+    let mut hps_n = 0.0f32;
+    for i in i_lo..=i_hi {
+        let i2 = i * 2;
+        let i3 = i * 3;
+        if i3 >= nyquist {
+            break;
+        }
+        let p = mag[i] * mag[i2] * mag[i3];
+        hps_sum += p;
+        hps_n += 1.0;
+        if p > best_p {
+            best_p = p;
+            best_i = i;
+        }
+    }
+    let hps_mean = (hps_sum / hps_n.max(1.0)).max(1e-12);
+    let conf = best_p / hps_mean;
+    if conf < 2.2 || mag[best_i] < mag_mean * 1.65 {
+        return None;
+    }
+    let y1 = mag[best_i];
+    let y0 = mag[best_i.saturating_sub(1)];
+    let y2 = mag[(best_i + 1).min(nyquist - 1)];
+    let denom = y0 - 2.0 * y1 + y2;
+    let delta = if denom.abs() > 1e-9 {
+        (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
+    Some(((best_i as f32 + delta) * bin_hz, conf))
+}
+
+fn stereo_width(left: &[f32], right: &[f32]) -> f32 {
+    let n = FAST_WIN.min(left.len()).min(right.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let sl = left.len() - n;
+    let sr = right.len() - n;
+    let mut lr = 0.0f32;
+    let mut l2 = 0.0f32;
+    let mut r2 = 0.0f32;
+    for i in 0..n {
+        let l = left[sl + i];
+        let r = right[sr + i];
+        lr += l * r;
+        l2 += l * l;
+        r2 += r * r;
+    }
+    let rms_l = (l2 / n as f32).sqrt();
+    let rms_r = (r2 / n as f32).sqrt();
+    if rms_l + rms_r < 1.5e-4 {
+        return 0.0;
+    }
+    let corr = (lr / (l2 * r2).sqrt().max(1e-9)).clamp(-1.0, 1.0);
+    let imbalance = (rms_l - rms_r).abs() / (rms_l + rms_r + 1e-8);
+    ((1.0 - corr.max(0.0)) * 0.72 + imbalance * 0.55).clamp(0.0, 1.0)
+}
+
+struct AudioBubble {
+    x: f32,
+    y: f32,
+    age: f32,
+    life: f32,
+    amp: f32,
+}
+
+fn tick_audio_bubbles(
+    bubbles: &mut Vec<AudioBubble>,
+    lamps: &mut [f32],
+    n: usize,
+    dt: f32,
+    flux: f32,
+    loud: f32,
+    bass: f32,
+    punch: f32,
+    motion: f32,
+    rng: &mut impl rand::Rng,
+) {
+    lamps.fill(0.0);
+    let hit = flux > (0.034 - punch * 0.01).max(0.014) && (bass > 0.12 || loud > 0.18);
+    if hit && bubbles.len() < 14 && rng.random::<f32>() < (0.22 + loud * 0.55 + punch * 0.12) {
+        bubbles.push(AudioBubble {
+            x: rng.random::<f32>(),
+            y: 0.0,
+            age: 0.0,
+            life: 0.45 + 0.55 * (1.0 - punch.min(1.0)),
+            amp: (0.55 + loud * 0.45).clamp(0.4, 1.0),
+        });
+    }
+    let rise = (0.55 + motion * 1.1) * dt;
+    for bubble in bubbles.iter_mut() {
+        bubble.age += dt;
+        bubble.x = (bubble.x + rise * 0.85).min(1.2);
+        bubble.y = bubble.x;
+    }
+    bubbles.retain(|b| b.age < b.life && b.x < 1.15);
+
+    let cols = n.min(lamps.len());
+    for bubble in bubbles.iter() {
+        let fade = (1.0 - bubble.age / bubble.life).clamp(0.0, 1.0);
+        let amt = bubble.amp * fade;
+        // x can travel past 1.0 before retain; never index with that raw column.
+        let z = (bubble.x * cols as f32).floor() as i32;
+        for (delta, falloff) in [(0i32, 1.0f32), (-1, 0.45), (1, 0.28)] {
+            let i = z + delta;
+            if i >= 0 && (i as usize) < cols {
+                lamps[i as usize] = lamps[i as usize].max(amt * falloff);
+            }
+        }
+    }
+}
+
+fn layout_midside(out: &mut [f32], bands: &[f32]) {
+    let n = out.len();
+    if n == 0 {
+        return;
+    }
+    let cols = to_four(bands);
+    for i in 0..n {
+        let z = (i * 4 / n.max(1)).min(3);
+        out[i] = cols[z];
+    }
+}
+
+fn follow_midside(
+    left: &[f32],
+    right: &[f32],
+    dt: f32,
+    attack_tau: f32,
+    release_tau: f32,
+    out: &mut Vec<f32>,
+) {
+    let n = FAST_WIN.min(left.len()).min(right.len());
+    if out.len() != 4 {
+        out.resize(4, 0.0);
+    }
+    if n == 0 {
+        return;
+    }
+    let sl = left.len() - n;
+    let sr = right.len() - n;
+    let mut mid_acc = 0.0f32;
+    let mut side_l_acc = 0.0f32;
+    let mut side_r_acc = 0.0f32;
+    for i in 0..n {
+        let l = left[sl + i];
+        let r = right[sr + i];
+        let mid = (l + r) * 0.5;
+        let side = (l - r) * 0.5;
+        mid_acc += mid * mid;
+        side_l_acc += side.max(0.0) * side.max(0.0);
+        side_r_acc += (-side).max(0.0) * (-side).max(0.0);
+    }
+    let inv = 1.0 / n as f32;
+    let mid = (mid_acc * inv).sqrt();
+    let side_l = (side_l_acc * inv).sqrt();
+    let side_r = (side_r_acc * inv).sqrt();
+    let peak = mid.max(side_l).max(side_r).max(1e-5);
+    let target = [
+        (side_l / peak).clamp(0.0, 1.0),
+        (mid / peak).clamp(0.0, 1.0),
+        (mid / peak).clamp(0.0, 1.0),
+        (side_r / peak).clamp(0.0, 1.0),
+    ];
+    for i in 0..4 {
+        let tau = if target[i] > out[i] { attack_tau } else { release_tau };
+        out[i] = ema_toward(out[i], target[i], dt, tau);
+    }
+}
+
+const KS_MAJOR: [f32; 12] = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const KS_MINOR: [f32; 12] = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+
+fn pearson_shifted(chroma: &[f32; 12], profile: &[f32; 12], root: usize) -> f32 {
+    let n = 12.0f32;
+    let c_mean = chroma.iter().sum::<f32>() / n;
+    let p_mean = profile.iter().sum::<f32>() / n;
+    let mut cov = 0.0f32;
+    let mut vc = 0.0f32;
+    let mut vp = 0.0f32;
+    for i in 0..12 {
+        let c = chroma[(i + root) % 12] - c_mean;
+        let p = profile[i] - p_mean;
+        cov += c * p;
+        vc += c * c;
+        vp += p * p;
+    }
+    let denom = (vc * vp).sqrt();
+    if denom < 1e-9 {
+        0.0
+    } else {
+        cov / denom
+    }
+}
+
+fn detect_key(samples: &[f32]) -> Option<(usize, bool, f32)> {
+    let (re, im) = compute_fft(samples)?;
+    let nyquist = FFT_SIZE / 2;
+    let bin_hz = SAMPLE_RATE as f32 / FFT_SIZE as f32;
+    let mut chroma = [0.0f32; 12];
+    let mut total = 0.0f32;
+    for i in 1..nyquist {
+        let freq = i as f32 * bin_hz;
+        if !(55.0..=2000.0).contains(&freq) {
+            continue;
+        }
+        let mag = (re[i] * re[i] + im[i] * im[i]).sqrt();
+        let midi = 69.0 + 12.0 * (freq / 440.0).log2();
+        let pc = midi.round().rem_euclid(12.0) as usize;
+        chroma[pc.min(11)] += mag;
+        total += mag;
+    }
+    if total < 1e-5 {
+        return None;
+    }
+    let mut best = 0usize;
+    let mut best_minor = false;
+    let mut best_c = f32::NEG_INFINITY;
+    for root in 0..12 {
+        let maj = pearson_shifted(&chroma, &KS_MAJOR, root);
+        if maj > best_c {
+            best_c = maj;
+            best = root;
+            best_minor = false;
+        }
+        let min = pearson_shifted(&chroma, &KS_MINOR, root);
+        if min > best_c {
+            best_c = min;
+            best = root;
+            best_minor = true;
+        }
+    }
+    if best_c < 0.28 {
+        return None;
+    }
+    Some((best, best_minor, best_c))
+}
+
+fn follow_key(samples: &[f32], dt: f32, key_hue: &mut f32) {
+    if let Some((root, minor, conf)) = detect_key(samples) {
+        if conf > 0.34 {
+            let target = root as f32 * 30.0 + if minor { 12.0 } else { 0.0 };
+            let alpha = (1.0 - (-dt / 0.22).exp()).clamp(0.04, 0.35);
+            *key_hue = lerp_hue(*key_hue, target, alpha);
+        }
+    }
 }
 
 struct ColorRipple {
@@ -1373,9 +2245,9 @@ fn tick_color_ripples(
 
 fn ripple_lifetime(shock: bool, n: usize, tune: &RippleTune) -> f32 {
     if n > 4 {
-        let max_i = (n as f32 - 1.0).max(1.0);
+        let max_i = (strip_count(n) as f32 - 1.0).max(1.0);
         let speed = if shock { tune.travel() * 1.65 } else { tune.travel() };
-        let strip_speed = (speed * max_i).max(4.0);
+        let strip_speed = (speed * max_i).max(2.0);
         let span = max_i / strip_speed;
         if shock {
             (span + 0.28).clamp(0.9, 1.8)
@@ -1390,7 +2262,7 @@ fn ripple_lifetime(shock: bool, n: usize, tune: &RippleTune) -> f32 {
 }
 
 fn origin_strip(origin: f32, n: usize) -> i32 {
-    let max = (n as i32 - 1).max(0);
+    let max = (strip_count(n) as i32 - 1).max(0);
     (origin.clamp(0.0, 1.0) * max as f32).round() as i32
 }
 
@@ -1578,13 +2450,13 @@ fn ripple_sample_strips(ripples: &[ColorRipple], i: usize, n: usize, tune: &Ripp
     let mut energy = 0.0f32;
     let mut hue = 0.0f32;
     let mut weight = 0.0f32;
-    let max_i = (n as i32 - 1).max(1);
-    let i = i as i32;
+    let max_i = (strip_count(n) as i32 - 1).max(1);
+    let col = lamp_col(i, n) as i32;
     for ripple in ripples {
         let origin = origin_strip(ripple.origin, n);
         let shock = ripple.shock;
         let travel = if shock { tune.travel() * 1.65 } else { tune.travel() };
-        let strip_speed = (travel * max_i as f32).max(4.0);
+        let strip_speed = (travel * max_i as f32).max(2.0);
         let lifetime = ripple_lifetime(shock, n, tune);
         let power = if shock {
             (0.9 + tune.shock_strength * 0.55).clamp(0.7, 2.0)
@@ -1595,7 +2467,7 @@ fn ripple_sample_strips(ripples: &[ColorRipple], i: usize, n: usize, tune: &Ripp
         let fade = (1.0 - ripple.age / lifetime)
             .clamp(0.0, 1.0)
             .powf(if shock { 0.85 } else { 1.15 });
-        let dist = (i - origin).abs() as f32;
+        let dist = (col - origin).abs() as f32;
         let thick = if shock {
             (1.0 + (tune.width - 0.1) * 2.4 + (tune.shock_strength - 1.0).max(0.0) * 0.8).floor().clamp(1.0, 4.0)
         } else {
@@ -1622,18 +2494,6 @@ fn ripple_hue(ripples: &[ColorRipple], i: usize, t: f32, n: usize, tune: &Ripple
     ripple_sample(ripples, i, t, n, tune).1
 }
 
-fn cascade_bloom(e: &mut [f32]) {
-    for i in 1..e.len() {
-        e[i] = e[i].max(e[i - 1] * 0.62).min(1.0);
-    }
-}
-
-fn cascade_fire(e: &mut [f32]) {
-    for i in 1..e.len() {
-        e[i] = (e[i] * 0.85 + e[i - 1] * 0.55).min(1.0);
-    }
-}
-
 fn fire_color(t: f32) -> [u8; 3] {
     let t = t.clamp(0.0, 1.0);
     if t < 0.5 {
@@ -1657,28 +2517,6 @@ fn spatial_blur(levels: &[f32; 4], spread: f32) -> [f32; 4] {
         levels[2] * (1.0 - mix) + blur[2] * mix,
         levels[3] * (1.0 - mix) + blur[3] * mix,
     ]
-}
-
-fn spatial_blur_n(levels: &mut [f32], spread: f32) {
-    let mix = spread.clamp(0.0, 1.0);
-    let n = levels.len();
-    if mix < 0.001 || n < 2 {
-        return;
-    }
-    let orig = levels.to_vec();
-    for i in 0..n {
-        let left = orig[i.saturating_sub(1)];
-        let center = orig[i];
-        let right = orig[(i + 1).min(n - 1)];
-        let blur = if i == 0 {
-            center * 0.78 + right * 0.22
-        } else if i + 1 == n {
-            center * 0.78 + left * 0.22
-        } else {
-            center * 0.62 + left * 0.19 + right * 0.19
-        };
-        levels[i] = center * (1.0 - mix) + blur * mix;
-    }
 }
 
 fn compute_fft(samples: &[f32]) -> Option<([f32; FFT_SIZE], [f32; FFT_SIZE])> {
@@ -1730,6 +2568,180 @@ fn kick_energy(re: &[f32], im: &[f32], sample_rate: u32) -> f32 {
     triangle_band(re, im, sample_rate, 30.0, 55.0, 105.0)
 }
 
+const EQ_BANDS: usize = 24;
+
+fn analyze_eq24(samples: &[f32], sample_rate: u32) -> [f32; EQ_BANDS] {
+    let Some((re, im)) = compute_fft(samples) else {
+        return [0.0; EQ_BANDS];
+    };
+    let lo_hz = 30.0f32;
+    let hi_hz = 12_000.0f32;
+    let ratio = hi_hz / lo_hz;
+    let n = EQ_BANDS as f32;
+    let mut bands = [0.0f32; EQ_BANDS];
+    for i in 0..EQ_BANDS {
+        let t0 = i as f32 / n;
+        let t1 = (i + 1) as f32 / n;
+        let mid_t = (t0 + t1) * 0.5;
+        let mid = lo_hz * ratio.powf(mid_t);
+        let lo = (lo_hz * ratio.powf(t0) * 0.72).max(20.0);
+        let hi = (lo_hz * ratio.powf(t1) * 1.38).min(16_000.0);
+        bands[i] = triangle_band(&re, &im, sample_rate, lo, mid, hi);
+        let tilt = (mid / 400.0).powf(-0.18).clamp(0.55, 1.85);
+        bands[i] *= tilt;
+    }
+    let peak = bands.iter().copied().fold(0.0f32, f32::max).max(1e-6);
+    for band in &mut bands {
+        *band = (*band / peak).clamp(0.0, 1.0);
+    }
+    bands
+}
+
+fn blur_neighbors(bands: &mut [f32]) {
+    if bands.len() < 3 {
+        return;
+    }
+    let orig = bands.to_vec();
+    for i in 0..bands.len() {
+        let left = orig[i.saturating_sub(1)];
+        let right = orig[(i + 1).min(orig.len() - 1)];
+        bands[i] = orig[i] * 0.62 + left * 0.19 + right * 0.19;
+    }
+}
+
+struct ColumnFx {
+    eq: Vec<f32>,
+    pan: f32,
+    clash_on: bool,
+    clash_l: f32,
+    clash_r: f32,
+    clash_flash: f32,
+    clash_x: f32,
+    snake_head: f32,
+    grav_h: f32,
+    melt: Vec<f32>,
+    wave_scroll: f32,
+    centroid: f32,
+}
+
+impl ColumnFx {
+    fn new() -> Self {
+        Self {
+            eq: Vec::new(),
+            pan: 0.5,
+            clash_on: false,
+            clash_l: 0.0,
+            clash_r: 1.0,
+            clash_flash: 0.0,
+            clash_x: 0.5,
+            snake_head: 0.0,
+            grav_h: 0.0,
+            melt: Vec::new(),
+            wave_scroll: 0.0,
+            centroid: 0.5,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.eq.fill(0.0);
+        self.pan = 0.5;
+        self.clash_on = false;
+        self.clash_l = 0.0;
+        self.clash_r = 1.0;
+        self.clash_flash = 0.0;
+        self.clash_x = 0.5;
+        self.snake_head = 0.0;
+        self.grav_h = 0.0;
+        self.melt.fill(0.0);
+        self.wave_scroll = 0.0;
+        self.centroid = 0.5;
+    }
+}
+
+fn stamp_gauss(out: &mut [f32], x: f32, sigma: f32) {
+    let n = out.len();
+    if n == 0 {
+        return;
+    }
+    let center = x.clamp(0.0, 1.0) * (n.saturating_sub(1) as f32);
+    let w = sigma.max(0.22);
+    for (i, slot) in out.iter_mut().enumerate() {
+        let d = i as f32 - center;
+        *slot = (*slot + (-d * d / (2.0 * w * w)).exp()).min(1.0);
+    }
+}
+
+fn tick_collision(
+    column: &mut ColumnFx,
+    n: usize,
+    dt: f32,
+    flux: f32,
+    peak: f32,
+    drive: f32,
+    motion: f32,
+    sparkle_lamps: &mut Vec<f32>,
+) {
+    if sparkle_lamps.len() != n {
+        sparkle_lamps.resize(n, 0.0);
+    }
+    for spark in sparkle_lamps.iter_mut() {
+        *spark *= (1.0 - dt * 8.0).max(0.0);
+    }
+    column.clash_flash = (column.clash_flash - dt * 3.4).max(0.0);
+    let hit = flux > 0.032 && (drive > 0.12 || peak > 0.16);
+    if hit && !column.clash_on && column.clash_flash < 0.08 {
+        column.clash_on = true;
+        column.clash_l = 0.0;
+        column.clash_r = 1.0;
+    }
+    if column.clash_on {
+        let speed = (1.45 + motion * 1.35 + flux * 1.1).clamp(1.1, 3.4);
+        column.clash_l = (column.clash_l + speed * dt).min(1.0);
+        column.clash_r = (column.clash_r - speed * dt).max(0.0);
+        if column.clash_l + 0.04 >= column.clash_r {
+            column.clash_x = ((column.clash_l + column.clash_r) * 0.5).clamp(0.0, 1.0);
+            column.clash_flash = (0.72 + peak * 0.28).clamp(0.7, 1.0);
+            column.clash_on = false;
+            let center = (column.clash_x * n.saturating_sub(1) as f32).round() as i32;
+            for d in -2i32..=2 {
+                let i = center + d;
+                if i >= 0 && (i as usize) < n {
+                    let fall = 1.0 - d.unsigned_abs() as f32 * 0.28;
+                    sparkle_lamps[i as usize] = sparkle_lamps[i as usize].max(column.clash_flash * fall);
+                }
+            }
+        }
+    }
+}
+
+fn tick_snake(
+    column: &mut ColumnFx,
+    energies: &mut [f32],
+    n: usize,
+    dt: f32,
+    flux: f32,
+    peak: f32,
+    drive: f32,
+    motion: f32,
+    ring_hit: bool,
+) {
+    if n == 0 {
+        return;
+    }
+    let crawl = (0.55 + motion * 2.4 + flux * 5.0) * n as f32;
+    let nudge = if ring_hit || flux > 0.045 { n as f32 * 0.35 } else { 0.0 };
+    column.snake_head = (column.snake_head + (crawl + nudge) * dt).rem_euclid(n as f32);
+    let loud = peak.max(drive);
+    let max_len = n.max(2);
+    let len = (1.0 + loud * (max_len as f32 - 1.0)).round().clamp(1.0, max_len as f32) as usize;
+    let head = column.snake_head.floor() as i32;
+    for k in 0..len {
+        let i = (head - k as i32).rem_euclid(n as i32) as usize;
+        let fade = (1.0 - k as f32 / len as f32).powf(1.25);
+        energies[i] = energies[i].max((0.18 + 0.82 * loud) * fade);
+    }
+}
+
 fn analyze_bands(samples: &[f32], sample_rate: u32) -> ([f32; 4], f32) {
     let Some((re, im)) = compute_fft(samples) else {
         return ([0.0; 4], 0.0);
@@ -1745,24 +2757,6 @@ fn analyze_bands(samples: &[f32], sample_rate: u32) -> ([f32; 4], f32) {
         bands[band] = triangle_band(&re, &im, sample_rate, *lo, *mid, *hi);
     }
     (bands, kick_energy(&re, &im, sample_rate))
-}
-
-fn analyze_spectrum(samples: &[f32], sample_rate: u32, bands: usize) -> (Vec<f32>, f32) {
-    let bands = bands.max(1);
-    let Some((re, im)) = compute_fft(samples) else {
-        return (vec![0.0; bands], 0.0);
-    };
-    let log_lo = 25.0f32.ln();
-    let log_hi = 12_000.0f32.ln();
-    let points = bands + 2;
-    let edge = |k: usize| {
-        let t = k as f32 / (points - 1) as f32;
-        (log_lo + (log_hi - log_lo) * t).exp()
-    };
-    let spec = (0..bands)
-        .map(|b| triangle_band(&re, &im, sample_rate, edge(b), edge(b + 1), edge(b + 2)))
-        .collect();
-    (spec, kick_energy(&re, &im, sample_rate))
 }
 
 fn fft(re: &mut [f32], im: &mut [f32]) {
@@ -1808,8 +2802,19 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Clone)]
+struct CapBuf {
+    mono: Vec<f32>,
+    left: Vec<f32>,
+    right: Vec<f32>,
+    wrote: u64,
+}
+
+#[cfg(target_os = "windows")]
 fn capture_loopback(
     samples: Arc<Mutex<Vec<f32>>>,
+    stereo: Arc<Mutex<[Vec<f32>; 2]>>,
+    seq: Arc<AtomicU64>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     capture_ok: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
@@ -1822,7 +2827,7 @@ fn capture_loopback(
         .ok()
         .map_err(|_| "COM init failed".to_string())?;
 
-    let per_device: Arc<Mutex<HashMap<String, Vec<f32>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let per_device: Arc<Mutex<HashMap<String, CapBuf>>> = Arc::new(Mutex::new(HashMap::new()));
     let wanted: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let preferred: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let live = Arc::new(AtomicUsize::new(0));
@@ -1869,6 +2874,8 @@ fn capture_loopback(
                 continue;
             }
             let samples = samples.clone();
+            let stereo = stereo.clone();
+            let seq = seq.clone();
             let per_device = per_device.clone();
             let wanted = wanted.clone();
             let preferred = preferred.clone();
@@ -1882,6 +2889,8 @@ fn capture_loopback(
                         &id,
                         &name,
                         samples,
+                        stereo,
+                        seq,
                         per_device,
                         wanted,
                         preferred,
@@ -1956,45 +2965,67 @@ fn list_render_targets() -> Vec<(String, String, bool)> {
 
 #[cfg(target_os = "windows")]
 fn publish_mix(
-    per_device: &Mutex<std::collections::HashMap<String, Vec<f32>>>,
+    per_device: &Mutex<std::collections::HashMap<String, CapBuf>>,
     samples: &Mutex<Vec<f32>>,
+    stereo: &Mutex<[Vec<f32>; 2]>,
+    seq: &AtomicU64,
     preferred: &Mutex<std::collections::HashSet<String>>,
 ) {
-    let mix = {
-        let Ok(map) = per_device.lock() else {
+    let (buf, wrote) = {
+        let Ok(mut map) = per_device.lock() else {
             return;
         };
         if map.is_empty() {
-            vec![0.0f32; FFT_SIZE]
+            (
+                CapBuf {
+                    mono: vec![0.0f32; RING],
+                    left: vec![0.0f32; RING],
+                    right: vec![0.0f32; RING],
+                    wrote: 0,
+                },
+                0u64,
+            )
         } else {
             let pref = preferred.lock().ok();
             let is_pref = |id: &str| pref.as_ref().map(|p| p.contains(id)).unwrap_or(false);
-            let mut best_pref: Option<(f32, &Vec<f32>)> = None;
-            let mut best_any: Option<(f32, &Vec<f32>)> = None;
+            let mut best_pref: Option<(f32, String)> = None;
+            let mut best_any: Option<(f32, String)> = None;
             for (id, buf) in map.iter() {
-                let rms = recent_rms(buf);
+                let rms = recent_rms(&buf.mono);
                 if best_any.as_ref().map(|(e, _)| rms > *e).unwrap_or(true) {
-                    best_any = Some((rms, buf));
+                    best_any = Some((rms, id.clone()));
                 }
                 if is_pref(id) && best_pref.as_ref().map(|(e, _)| rms > *e).unwrap_or(true) {
-                    best_pref = Some((rms, buf));
+                    best_pref = Some((rms, id.clone()));
                 }
             }
-            let chosen = match (best_pref, best_any) {
-                (Some((pref_rms, pref_buf)), Some((any_rms, any_buf)))
+            let picked_id = match (best_pref, best_any) {
+                (Some((pref_rms, pref_id)), Some((any_rms, any_id)))
                     if any_rms > pref_rms * 2.8 && any_rms > 0.012 =>
                 {
-                    any_buf
+                    any_id
                 }
-                (Some((_, pref_buf)), _) => pref_buf,
-                (_, Some((_, any_buf))) => any_buf,
+                (Some((_, pref_id)), _) => pref_id,
+                (_, Some((_, any_id))) => any_id,
                 _ => return,
             };
-            chosen.clone()
+            if let Some(picked) = map.get_mut(&picked_id) {
+                let wrote = picked.wrote;
+                picked.wrote = 0;
+                (picked.clone(), wrote)
+            } else {
+                return;
+            }
         }
     };
     if let Ok(mut guard) = samples.lock() {
-        *guard = mix;
+        *guard = buf.mono;
+        if wrote > 0 {
+            seq.fetch_add(wrote, Ordering::Relaxed);
+        }
+    }
+    if let Ok(mut guard) = stereo.lock() {
+        *guard = [buf.left, buf.right];
     }
 }
 
@@ -2003,7 +3034,9 @@ fn capture_one_output(
     id: &str,
     name: &str,
     samples: Arc<Mutex<Vec<f32>>>,
-    per_device: Arc<Mutex<std::collections::HashMap<String, Vec<f32>>>>,
+    stereo: Arc<Mutex<[Vec<f32>; 2]>>,
+    seq: Arc<AtomicU64>,
+    per_device: Arc<Mutex<std::collections::HashMap<String, CapBuf>>>,
     wanted: Arc<Mutex<std::collections::HashSet<String>>>,
     preferred: Arc<Mutex<std::collections::HashSet<String>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -2030,6 +3063,11 @@ fn capture_one_output(
     }
     let device = device.ok_or_else(|| format!("output gone: {name}"))?;
     let mut audio_client = device.get_iaudioclient().map_err(|e| e.to_string())?;
+    let mix_ch = audio_client
+        .get_mixformat()
+        .map(|fmt| fmt.get_nchannels() as usize)
+        .unwrap_or(2)
+        .max(1);
     let format = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, 2, None);
     let mode = StreamMode::EventsShared {
         autoconvert: true,
@@ -2043,10 +3081,14 @@ fn capture_one_output(
     audio_client.start_stream().map_err(|e| e.to_string())?;
     live.fetch_add(1, Ordering::Relaxed);
     capture_ok.store(true, Ordering::Relaxed);
-    legion_rgb_driver::debug_log(&format!("AUDIO: WASAPI loopback started on {name}"));
+    legion_rgb_driver::debug_log(&format!(
+        "AUDIO: WASAPI loopback started on {name} mix_ch={mix_ch} capture_ch=2"
+    ));
 
     let mut queue: VecDeque<u8> = VecDeque::new();
-    let mut ring = vec![0.0f32; FFT_SIZE];
+    let mut ring = vec![0.0f32; RING];
+    let mut ring_l = vec![0.0f32; RING];
+    let mut ring_r = vec![0.0f32; RING];
     let mut write_at = 0usize;
     let channels = 2usize;
     let bytes_per_sample = 4usize;
@@ -2081,6 +3123,7 @@ fn capture_one_output(
         }
         stale_reads = 0;
         let frame_bytes = bytes_per_sample * channels;
+        let mut wrote = 0u64;
         while queue.len() >= frame_bytes {
             let mut left = [0u8; 4];
             let mut right = [0u8; 4];
@@ -2092,29 +3135,399 @@ fn capture_one_output(
             }
             let l = f32::from_le_bytes(left);
             let r = f32::from_le_bytes(right);
+            ring_l[write_at] = l;
+            ring_r[write_at] = r;
             ring[write_at] = (l + r) * 0.5;
-            write_at = (write_at + 1) % FFT_SIZE;
+            write_at = (write_at + 1) % RING;
+            wrote += 1;
         }
-        let window = {
-            let mut window = vec![0.0f32; FFT_SIZE];
-            let (tail, head) = ring.split_at(write_at);
-            let split = FFT_SIZE - write_at;
+        let unwrap_ring = |src: &[f32]| {
+            let mut window = vec![0.0f32; RING];
+            let (tail, head) = src.split_at(write_at);
+            let split = RING - write_at;
             window[split..].copy_from_slice(tail);
             window[..split].copy_from_slice(head);
             window
         };
         if let Ok(mut map) = per_device.lock() {
-            map.insert(id.to_string(), window);
+            if let Some(old) = map.get(id) {
+                wrote = wrote.saturating_add(old.wrote);
+            }
+            map.insert(
+                id.to_string(),
+                CapBuf {
+                    mono: unwrap_ring(&ring),
+                    left: unwrap_ring(&ring_l),
+                    right: unwrap_ring(&ring_r),
+                    wrote,
+                },
+            );
         }
-        publish_mix(&per_device, &samples, &preferred);
+        publish_mix(&per_device, &samples, &stereo, &seq, &preferred);
     }
 
     let _ = audio_client.stop_stream();
     if let Ok(mut map) = per_device.lock() {
         map.remove(id);
     }
-    publish_mix(&per_device, &samples, &preferred);
+    publish_mix(&per_device, &samples, &stereo, &seq, &preferred);
     live.fetch_sub(1, Ordering::Relaxed);
     capture_ok.store(live.load(Ordering::Relaxed) > 0, Ordering::Relaxed);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+    use strum::IntoEnumIterator;
+
+    fn lum(c: [u8; 3]) -> i32 {
+        c[0] as i32 + c[1] as i32 + c[2] as i32
+    }
+
+    fn all_same(rgb: &[[u8; 3]]) -> bool {
+        rgb.windows(2).all(|w| w[0] == w[1])
+    }
+
+    fn test_params(style: AudioStyle, ripple: bool) -> AudioReactParams {
+        let mut p = AudioReactParams::default();
+        p.style = style;
+        p.min_brightness = 0;
+        p.idle_brightness = 0;
+        p.color_ramp = 0.0;
+        p.spread = 0.0;
+        p.ripple_color = ripple;
+        p.color_mode = AudioColorMode::Custom;
+        p.custom_rgb = [255; 12];
+        p
+    }
+
+    fn render_style(style: AudioStyle, n: usize, levels: [f32; 4], ripple: bool) -> Vec<[u8; 3]> {
+        let p = test_params(style, ripple);
+        let mut wave_phase = 0.4f32;
+        let mut tint_state = vec![[0.0; 3]; n];
+        let mut sparkle = [0.0f32; 4];
+        let mut sparkle_lamps = vec![0.0f32; n];
+        let mut chase = 1.2f32;
+        let mut strobe = 0.0f32;
+        let mut vu_hold = 0.7f32;
+        let mut vu_peak = 0.85f32;
+        let mut tempo_phase = 0.0f32;
+        let wave: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.2).sin() * 0.4).collect();
+        let mut scope_hold = Vec::new();
+        let mut scope_peak = 0.002f32;
+        let mut spec_hist_e = Vec::new();
+        let mut spec_hist_h = Vec::new();
+        let mut spec_hist_bands = [[0.0f32; 4]; 4];
+        let left = levels.to_vec();
+        let right = [levels[3], levels[2], levels[1], levels[0]].to_vec();
+        let mut color_ripples = Vec::new();
+        let mut prev_gate = [0.0f32; 4];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut column = ColumnFx::new();
+        if matches!(style, AudioStyle::Bubbles) {
+            sparkle_lamps[0] = 0.8;
+            if n > 6 {
+                sparkle_lamps[6] = 0.5;
+            }
+        }
+        if matches!(style, AudioStyle::Eq24 | AudioStyle::Wavelength | AudioStyle::Melt) {
+            column.eq = (0..n).map(|i| i as f32 / (n.saturating_sub(1) as f32).max(1.0)).collect();
+        }
+        if matches!(style, AudioStyle::PanNeedle) {
+            column.pan = 0.2;
+        }
+        render_audio(
+            p,
+            &levels,
+            0.0,
+            0.12,
+            &mut wave_phase,
+            0.3,
+            &mut tint_state,
+            &mut sparkle,
+            &mut sparkle_lamps,
+            &mut chase,
+            &mut strobe,
+            &mut vu_hold,
+            &mut vu_peak,
+            &mut tempo_phase,
+            &wave,
+            &mut scope_hold,
+            &mut scope_peak,
+            &mut spec_hist_e,
+            &mut spec_hist_h,
+            &mut spec_hist_bands,
+            &left,
+            &right,
+            &mut color_ripples,
+            &mut prev_gate,
+            0.016,
+            n,
+            ripple,
+            false,
+            0.5,
+            false,
+            210.0,
+            0.4,
+            &mut rng,
+            &mut column,
+        )
+    }
+
+    fn render_spec_24(levels: [f32; 4]) -> Vec<[u8; 3]> {
+        let p = test_params(AudioStyle::Spectrogram, false);
+        let n = 24;
+        let mut wave_phase = 0.0f32;
+        let mut tint_state = vec![[0.0; 3]; n];
+        let mut sparkle = [0.0f32; 4];
+        let mut sparkle_lamps = vec![0.0f32; n];
+        let mut chase = 0.0f32;
+        let mut strobe = 0.0f32;
+        let mut vu_hold = 0.0f32;
+        let mut vu_peak = 0.0f32;
+        let mut tempo_phase = 0.0f32;
+        let wave = vec![0.0f32; 64];
+        let mut scope_hold = Vec::new();
+        let mut scope_peak = 0.002f32;
+        let mut spec_hist_e = Vec::new();
+        let mut spec_hist_h = Vec::new();
+        let mut spec_hist_bands = [[0.0f32; 4]; 4];
+        let left = levels.to_vec();
+        let mut color_ripples = Vec::new();
+        let mut prev_gate = [0.0f32; 4];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let mut column = ColumnFx::new();
+        let mut rgb = Vec::new();
+        for _ in 0..4 {
+            rgb = render_audio(
+                p,
+                &levels,
+                0.0,
+                0.05,
+                &mut wave_phase,
+                0.0,
+                &mut tint_state,
+                &mut sparkle,
+                &mut sparkle_lamps,
+                &mut chase,
+                &mut strobe,
+                &mut vu_hold,
+                &mut vu_peak,
+                &mut tempo_phase,
+                &wave,
+                &mut scope_hold,
+                &mut scope_peak,
+                &mut spec_hist_e,
+                &mut spec_hist_h,
+                &mut spec_hist_bands,
+                &left,
+                &left,
+                &mut color_ripples,
+                &mut prev_gate,
+                0.016,
+                n,
+                false,
+                false,
+                0.5,
+                false,
+                210.0,
+                0.2,
+                &mut rng,
+                &mut column,
+            );
+        }
+        rgb
+    }
+
+    #[test]
+    fn every_style_renders_zone_and_grid() {
+        let levels = [0.2, 0.5, 0.8, 1.0];
+        for style in AudioStyle::iter().filter(|s| !matches!(s, AudioStyle::Ripple)) {
+            for n in [4usize, 24] {
+                let rgb = render_style(style, n, levels, false);
+                assert_eq!(rgb.len(), n, "{style:?} n={n} length");
+            }
+        }
+        let rgb = render_style(AudioStyle::Levels, 24, levels, true);
+        assert_eq!(rgb.len(), 24);
+    }
+
+    #[test]
+    fn washes_stay_flat() {
+        let levels = [0.25, 0.55, 0.8, 1.0];
+        for style in [
+            AudioStyle::Pulse,
+            AudioStyle::Strobe,
+            AudioStyle::TempoPulse,
+            AudioStyle::Pitch,
+            AudioStyle::KeyColor,
+        ] {
+            for n in [4usize, 24] {
+                let rgb = render_style(style, n, levels, false);
+                assert!(all_same(&rgb), "{style:?} n={n} should be a flat wash");
+            }
+        }
+    }
+
+    #[test]
+    fn levels_zone_is_not_a_meter() {
+        let rgb = render_style(AudioStyle::Levels, 4, [0.15, 0.45, 0.75, 1.0], false);
+        assert!(lum(rgb[0]) < lum(rgb[1]));
+        assert!(lum(rgb[1]) < lum(rgb[2]));
+        assert!(lum(rgb[2]) < lum(rgb[3]));
+    }
+
+    #[test]
+    fn levels_grid_fills_left_of_each_band() {
+        let rgb = render_style(AudioStyle::Levels, 24, [0.5, 0.0, 0.0, 0.0], false);
+        let col0: Vec<i32> = (0..6).map(|i| lum(rgb[i])).collect();
+        assert!(col0[0] > col0[5], "band meter should fill from the left: {col0:?}");
+        for w in col0.windows(2) {
+            assert!(w[0] >= w[1], "band meter should be monotonic: {col0:?}");
+        }
+        assert!(col0.iter().any(|&a| col0.iter().any(|&b| a != b)), "24-lamp levels must vary inside a band");
+    }
+
+    #[test]
+    fn spectrogram_scrolls_left_to_right() {
+        let rgb = render_spec_24([1.0, 0.05, 0.05, 0.05]);
+        assert!(lum(rgb[0]) > lum(rgb[23]), "newest energy should be on the left");
+    }
+
+    #[test]
+    fn wave_travels_across_columns() {
+        let rgb = render_style(AudioStyle::Wave, 24, [0.7, 0.6, 0.5, 0.4], false);
+        let lumas: Vec<i32> = rgb.iter().copied().map(lum).collect();
+        assert!(
+            lumas.iter().any(|&a| lumas.iter().any(|&b| (a - b).abs() > 8)),
+            "wave should vary across columns: {lumas:?}"
+        );
+    }
+
+    #[test]
+    fn beat_gates_light_whole_strip() {
+        let rgb = render_style(AudioStyle::BeatGates, 24, [1.0, 0.0, 1.0, 0.0], false);
+        for row in 1..6 {
+            assert_eq!(rgb[row], rgb[0]);
+            assert_eq!(rgb[12 + row], rgb[12]);
+        }
+        assert_ne!(lum(rgb[0]), lum(rgb[6]));
+    }
+
+    #[test]
+    fn vu_fills_left_to_right() {
+        let rgb = render_style(AudioStyle::Vu, 24, [0.7, 0.7, 0.7, 0.7], false);
+        assert!(lum(rgb[0]) >= lum(rgb[8]));
+        assert!(lum(rgb[8]) >= lum(rgb[20]) || lum(rgb[8]) + lum(rgb[0]) > lum(rgb[20]));
+    }
+
+    #[test]
+    fn spectrogram_and_meter_helpers() {
+        let meters = expand_meters(&[0.5, 0.0, 0.0, 0.0], 24);
+        assert!((meters[0] - 1.0).abs() < 1e-5);
+        assert!(meters[5] < 0.01);
+        let strips = expand_strips(&[0.2, 0.4, 0.6, 0.8], 24);
+        assert!((strips[0] - 0.2).abs() < 1e-5);
+        assert!((strips[23] - 0.8).abs() < 1e-5);
+        let zone = expand_meters(&[0.2, 0.4, 0.6, 0.8], 4);
+        assert!((zone[0] - 0.2).abs() < 1e-5);
+        assert!((zone[3] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn eq24_grid_varies_across_columns() {
+        let rgb = render_style(AudioStyle::Eq24, 24, [0.2, 0.5, 0.8, 1.0], false);
+        let lumas: Vec<i32> = rgb.iter().copied().map(lum).collect();
+        assert!(
+            lumas.iter().any(|&a| lumas.iter().any(|&b| (a - b).abs() > 8)),
+            "24-band EQ should vary across columns: {lumas:?}"
+        );
+        assert!(lum(rgb[0]) < lum(rgb[23]), "eq ramp should be brighter on the right: {lumas:?}");
+    }
+
+    #[test]
+    fn gravcenter_is_brighter_in_the_middle() {
+        let rgb = render_style(AudioStyle::Gravcenter, 24, [0.85, 0.85, 0.85, 0.85], false);
+        assert!(
+            lum(rgb[11]) + lum(rgb[12]) > lum(rgb[0]) + lum(rgb[23]),
+            "gravcenter should fill from the middle"
+        );
+        let zone = render_style(AudioStyle::Gravcenter, 4, [0.85, 0.85, 0.85, 0.85], false);
+        assert!(lum(zone[1]) + lum(zone[2]) > lum(zone[0]) + lum(zone[3]));
+    }
+
+    #[test]
+    fn wavelength_varies_across_columns() {
+        let rgb = render_style(AudioStyle::Wavelength, 24, [0.2, 0.5, 0.8, 1.0], false);
+        let lumas: Vec<i32> = rgb.iter().copied().map(lum).collect();
+        assert!(
+            lumas.iter().any(|&a| lumas.iter().any(|&b| (a - b).abs() > 8)),
+            "wavelength should vary: {lumas:?}"
+        );
+    }
+
+    #[test]
+    fn column_styles_render_zone_and_grid() {
+        for style in [
+            AudioStyle::Eq24,
+            AudioStyle::PanNeedle,
+            AudioStyle::Collision,
+            AudioStyle::Snake,
+            AudioStyle::Gravcenter,
+            AudioStyle::Melt,
+            AudioStyle::Wavelength,
+        ] {
+            for n in [4usize, 24] {
+                let rgb = render_style(style, n, [0.3, 0.5, 0.7, 0.9], false);
+                assert_eq!(rgb.len(), n, "{style:?} n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn hud_reports_locked_bpm_and_drop() {
+        let mut p = AudioReactParams::default();
+        p.bpm = 120;
+        p.bpm_locked = true;
+        p.drop = true;
+        let hud = p.hud();
+        assert_eq!(hud.bpm, 120);
+        assert!(hud.locked);
+        assert!(hud.drop);
+        p.bpm_locked = false;
+        assert_eq!(p.hud().bpm, 0);
+        assert!(!p.hud().locked);
+        assert_eq!(audio_flow::bpm_from_ibi(0.5, true), 120);
+        assert_eq!(audio_flow::bpm_from_ibi(0.5, false), 0);
+    }
+
+    #[test]
+    fn audio_bubbles_do_not_panic_past_the_end() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        for n in [4usize, 24] {
+            let mut lamps = vec![0.0f32; n];
+            let mut bubbles = vec![
+                AudioBubble {
+                    x: 1.0,
+                    y: 1.0,
+                    age: 0.0,
+                    life: 1.0,
+                    amp: 1.0,
+                },
+                AudioBubble {
+                    x: 1.14,
+                    y: 1.14,
+                    age: 0.02,
+                    life: 1.0,
+                    amp: 0.8,
+                },
+            ];
+            tick_audio_bubbles(&mut bubbles, &mut lamps, n, 0.016, 0.0, 0.0, 0.0, 0.0, 0.7, &mut rng);
+            assert_eq!(lamps.len(), n);
+            assert!(lamps.iter().all(|v| v.is_finite()));
+        }
+    }
+}
+

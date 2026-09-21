@@ -1,7 +1,10 @@
 use crate::enums::{Direction, Effects, Message, SwipeMode};
 
 use crossbeam_channel::{Receiver, Sender};
-use effects::{ambient, audio, aurora, battery, christmas, disco, fade, lightning, rain, ripple, scanner, stars, swipe, temperature};
+use effects::{
+    ambient, audio, aurora, battery, bounce, christmas, comet, digital_rain, disco, dissolve, fade, fireworks, juggle, lightning, nexus,
+    pacifica, rain, ripple, scanner, stars, swipe, temperature, typeheat,
+};
 use error_stack::{Result, ResultExt};
 use legion_rgb_driver::{BaseEffects, Keyboard, SPEED_RANGE};
 use profile::Profile;
@@ -167,8 +170,24 @@ impl EffectManager {
 
     pub fn set_live_audio(&self, params: audio::AudioReactParams) {
         if let Ok(mut guard) = self.audio_params.lock() {
+            let resolved = guard.auto_resolved;
+            let bpm = guard.bpm;
+            let bpm_locked = guard.bpm_locked;
+            let drop = guard.drop;
             *guard = params.normalized();
+            guard.auto_resolved = resolved;
+            guard.bpm = bpm;
+            guard.bpm_locked = bpm_locked;
+            guard.drop = drop;
         }
+    }
+
+    pub fn audio_resolved(&self) -> crate::enums::AudioAnalysis {
+        self.audio_hud().resolved
+    }
+
+    pub fn audio_hud(&self) -> audio::AudioHud {
+        self.audio_params.lock().ok().map(|g| g.hud()).unwrap_or_default()
     }
 
     pub fn set_live_scene(&self, effect: Effects, rgb: [u8; 12]) {
@@ -355,6 +374,15 @@ impl Inner {
             Effects::Aurora { params } => aurora::play(self, params, profile.rgb_array()),
             Effects::Scanner { params } => scanner::play(self, params, profile.rgb_array()),
             Effects::Battery { params } => battery::play(self, params, profile.rgb_array()),
+            Effects::TypeHeat { params } => typeheat::play(self, params, profile.rgb_array()),
+            Effects::Pacifica { params } => pacifica::play(self, params, profile.rgb_array()),
+            Effects::DigitalRain { params } => digital_rain::play(self, params, profile.rgb_array()),
+            Effects::Fireworks { params } => fireworks::play(self, params, profile.rgb_array()),
+            Effects::Nexus { params } => nexus::play(self, params, profile.rgb_array()),
+            Effects::Comet { params } => comet::play(self, params, profile.rgb_array()),
+            Effects::Juggle { params } => juggle::play(self, params, profile.rgb_array()),
+            Effects::Bounce { params } => bounce::play(self, params, profile.rgb_array()),
+            Effects::Dissolve { params } => dissolve::play(self, params, profile.rgb_array()),
         }
     }
 
