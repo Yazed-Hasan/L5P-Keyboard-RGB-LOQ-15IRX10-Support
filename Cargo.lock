@@ -3684,6 +3684,7 @@ dependencies = [
  "tray-icon",
  "wasapi",
  "winapi",
+ "windows 0.61.3",
  "winres",
 ]
 

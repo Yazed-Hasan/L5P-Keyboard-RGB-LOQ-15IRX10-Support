@@ -1,7 +1,7 @@
 use crate::enums::{Direction, Effects, Message, SwipeMode};
 
 use crossbeam_channel::{Receiver, Sender};
-use effects::{ambient, audio, christmas, disco, fade, lightning, ripple, swipe, temperature};
+use effects::{ambient, audio, aurora, battery, christmas, disco, fade, lightning, rain, ripple, scanner, stars, swipe, temperature};
 use error_stack::{Result, ResultExt};
 use legion_rgb_driver::{BaseEffects, Keyboard, SPEED_RANGE};
 use profile::Profile;
@@ -38,9 +38,12 @@ pub enum ManagerCreationError {
 pub struct EffectManager {
     pub tx: Sender<Message>,
     pub is_dynamic_lighting: bool,
+    pub lamp_count: u16,
     pub window_active: Arc<AtomicBool>,
     effect_speed: Arc<AtomicU8>,
     audio_params: Arc<Mutex<audio::AudioReactParams>>,
+    scene_params: Arc<Mutex<effects::scene::SceneLive>>,
+    fine_lamps: Arc<AtomicBool>,
     inner_handle: Option<JoinHandle<()>>,
     stop_signals: StopSignals,
 }
@@ -54,6 +57,8 @@ struct Inner {
     is_dynamic_lighting: bool,
     effect_speed: Arc<AtomicU8>,
     audio_params: Arc<Mutex<audio::AudioReactParams>>,
+    scene_params: Arc<Mutex<effects::scene::SceneLive>>,
+    fine_lamps: Arc<AtomicBool>,
     // Can't drop this else it stops "reserving" whatever underlying implementation identifier it uses
     #[allow(dead_code)]
     single_instance: SingleInstance,
@@ -86,9 +91,12 @@ impl EffectManager {
             .attach_printable("https://github.com/4JX/L5P-Keyboard-RGB#usage")?;
 
         let is_dynamic_lighting = keyboard.is_dynamic_lighting();
+        let lamp_count = keyboard.lamp_count();
         let window_active = keyboard.window_active_handle();
         let effect_speed = Arc::new(AtomicU8::new(1));
         let audio_params = Arc::new(Mutex::new(audio::AudioReactParams::default()));
+        let scene_params = Arc::new(Mutex::new(effects::scene::SceneLive::default()));
+        let fine_lamps = Arc::new(AtomicBool::new(false));
 
         let (tx, rx) = crossbeam_channel::unbounded::<Message>();
 
@@ -100,6 +108,8 @@ impl EffectManager {
             is_dynamic_lighting,
             effect_speed: effect_speed.clone(),
             audio_params: audio_params.clone(),
+            scene_params: scene_params.clone(),
+            fine_lamps: fine_lamps.clone(),
             single_instance,
         };
 
@@ -136,9 +146,12 @@ impl EffectManager {
         let manager = Self {
             tx,
             is_dynamic_lighting,
+            lamp_count,
             window_active,
             effect_speed,
             audio_params,
+            scene_params,
+            fine_lamps,
             inner_handle: Some(inner_handle),
             stop_signals,
         };
@@ -158,6 +171,12 @@ impl EffectManager {
         }
     }
 
+    pub fn set_live_scene(&self, effect: Effects, rgb: [u8; 12]) {
+        if let Ok(mut guard) = self.scene_params.lock() {
+            *guard = effects::scene::SceneLive { effect, rgb };
+        }
+    }
+
     pub fn set_live_speed(&self, speed: u8) {
         let speed = speed.clamp(1, 10);
         self.effect_speed.store(speed, Ordering::Relaxed);
@@ -166,6 +185,15 @@ impl EffectManager {
             speed,
             wdl_delay_ms(speed)
         ));
+    }
+
+    pub fn set_fine_lamps(&self, enabled: bool) {
+        self.fine_lamps.store(enabled, Ordering::Relaxed);
+        legion_rgb_driver::debug_log(&format!("LAMPS: fine_24={}", enabled));
+    }
+
+    pub fn fine_lamps(&self) -> bool {
+        self.fine_lamps.load(Ordering::Relaxed)
     }
 
     pub fn custom_effect(&self, effect: CustomEffect) {
@@ -188,7 +216,13 @@ impl Inner {
         self.stop_signals.store_false();
         self.effect_speed.store(profile.speed.max(1), Ordering::Relaxed);
         if let Ok(mut guard) = self.audio_params.lock() {
-            *guard = audio::AudioReactParams::from_effect(profile.effect);
+            *guard = audio::AudioReactParams::from_effect(profile.effect).with_rgb(profile.rgb_array());
+        }
+        if let Ok(mut guard) = self.scene_params.lock() {
+            *guard = effects::scene::SceneLive {
+                effect: profile.effect,
+                rgb: profile.rgb_array(),
+            };
         }
         legion_rgb_driver::debug_log(&format!(
             "EFFECT: switch to {:?} speed={}",
@@ -222,17 +256,43 @@ impl Inner {
         self.effect_speed.load(Ordering::Relaxed).clamp(1, 10)
     }
 
+    pub(crate) fn lamp_n(&self) -> usize {
+        if self.fine_lamps.load(Ordering::Relaxed) {
+            effects::lamps::count(self.keyboard.lamp_count())
+        } else {
+            4
+        }
+    }
+
+    pub(crate) fn paint_lamps(&mut self, lamps: &[[u8; 3]]) {
+        if self.fine_lamps.load(Ordering::Relaxed) && self.keyboard.lamp_count() >= 8 {
+            let _ = self.keyboard.set_lamp_colors(lamps);
+        } else {
+            let rgb = legion_rgb_driver::zone_colors_from_lamps(lamps);
+            let _ = self.keyboard.set_colors_to(&rgb);
+        }
+    }
+
+    fn apply_profile_colors(&mut self, profile: &Profile) {
+        if self.fine_lamps.load(Ordering::Relaxed) && self.keyboard.lamp_count() >= 8 && profile.has_lamp_colors() {
+            let n = self.lamp_n();
+            let _ = self.keyboard.set_lamp_colors(&profile.lamp_colors(n));
+        } else {
+            let _ = self.keyboard.set_colors_to(&profile.rgb_array());
+        }
+    }
+
     fn apply_effect(&mut self, profile: &mut Profile, rng: &mut ThreadRng) {
         match profile.effect {
             Effects::Static => {
-                self.keyboard.set_colors_to(&profile.rgb_array()).unwrap();
+                self.apply_profile_colors(profile);
                 self.keyboard.set_effect(BaseEffects::Static).unwrap();
                 if self.is_dynamic_lighting {
                     self.wdl_maintain();
                 }
             }
             Effects::Breath => {
-                self.keyboard.set_colors_to(&profile.rgb_array()).unwrap();
+                self.apply_profile_colors(profile);
                 if self.is_dynamic_lighting {
                     self.play_breath_wdl(profile);
                 } else {
@@ -290,6 +350,11 @@ impl Inner {
             Effects::Temperature => temperature::play(self),
             Effects::Ripple => ripple::play(self, profile),
             Effects::AudioReact { .. } => audio::play(self, profile),
+            Effects::Stars { params } => stars::play(self, params, profile.rgb_array()),
+            Effects::Rain { params } => rain::play(self, params, profile.rgb_array()),
+            Effects::Aurora { params } => aurora::play(self, params, profile.rgb_array()),
+            Effects::Scanner { params } => scanner::play(self, params, profile.rgb_array()),
+            Effects::Battery { params } => battery::play(self, params, profile.rgb_array()),
         }
     }
 
@@ -338,15 +403,13 @@ impl Inner {
 
     /// Software Breath effect for Windows Dynamic Lighting devices.
     fn play_breath_wdl(&mut self, profile: &Profile) {
-        let base_colors = profile.rgb_array();
+        let n = self.lamp_n();
+        let base = profile.lamp_colors(n);
         let mut phase: f64 = 0.0;
         while !self.stop_signals.manager_stop_signal.load(Ordering::SeqCst) {
-            let factor = phase.sin() * 0.5 + 0.5; // oscillates 0.0..1.0
-            let mut rgb = [0u8; 12];
-            for i in 0..12 {
-                rgb[i] = (base_colors[i] as f64 * factor) as u8;
-            }
-            self.keyboard.set_colors_to(&rgb).unwrap();
+            let factor = (phase.sin() * 0.5 + 0.5) as f32;
+            let lamps: Vec<[u8; 3]> = base.iter().copied().map(|c| effects::lamps::scale_rgb(c, factor)).collect();
+            self.paint_lamps(&lamps);
             phase += self.live_speed() as f64 * 0.08;
             if phase > std::f64::consts::TAU {
                 phase -= std::f64::consts::TAU;
@@ -357,11 +420,24 @@ impl Inner {
 
     /// Software Smooth (rainbow cycle) effect for Windows Dynamic Lighting devices.
     fn play_smooth_wdl(&mut self) {
+        let n = self.lamp_n();
         let mut hue: f64 = 0.0;
+        legion_rgb_driver::debug_log(&format!("EFFECT: smooth-wave lamps={n}"));
         while !self.stop_signals.manager_stop_signal.load(Ordering::SeqCst) {
-            let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
-            let rgb = [r, g, b, r, g, b, r, g, b, r, g, b];
-            self.keyboard.set_colors_to(&rgb).unwrap();
+            if n <= 4 {
+                let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
+                let rgb = [r, g, b, r, g, b, r, g, b, r, g, b];
+                let _ = self.keyboard.set_colors_to(&rgb);
+            } else {
+                let lamps: Vec<[u8; 3]> = (0..n)
+                    .map(|i| {
+                        let t = if n <= 1 { 0.0 } else { i as f64 / (n - 1) as f64 };
+                        let (r, g, b) = hsv_to_rgb((hue + t * 90.0).rem_euclid(360.0), 1.0, 1.0);
+                        [r, g, b]
+                    })
+                    .collect();
+                self.paint_lamps(&lamps);
+            }
             hue = (hue + self.live_speed() as f64 * 3.0) % 360.0;
             thread::sleep(Duration::from_millis(50));
         }
@@ -369,31 +445,117 @@ impl Inner {
 
     /// Software Wave effect for Windows Dynamic Lighting devices.
     fn play_wave_wdl(&mut self, direction: Direction) {
+        let n = self.lamp_n();
         let mut hue: f64 = 0.0;
         let dir_mul: f64 = match direction {
             Direction::Left => 1.0,
             Direction::Right => -1.0,
         };
+        legion_rgb_driver::debug_log(&format!("EFFECT: wave lamps={n} dir={direction:?}"));
         while !self.stop_signals.manager_stop_signal.load(Ordering::SeqCst) {
-            let mut rgb = [0u8; 12];
-            for z in 0..4 {
-                let h = (hue + z as f64 * 90.0 * dir_mul).rem_euclid(360.0);
-                let (r, g, b) = hsv_to_rgb(h, 1.0, 1.0);
-                rgb[z * 3] = r;
-                rgb[z * 3 + 1] = g;
-                rgb[z * 3 + 2] = b;
+            if n <= 4 {
+                let mut rgb = [0u8; 12];
+                for z in 0..4 {
+                    let h = (hue + z as f64 * 90.0 * dir_mul).rem_euclid(360.0);
+                    let (r, g, b) = hsv_to_rgb(h, 1.0, 1.0);
+                    rgb[z * 3] = r;
+                    rgb[z * 3 + 1] = g;
+                    rgb[z * 3 + 2] = b;
+                }
+                let _ = self.keyboard.set_colors_to(&rgb);
+            } else {
+                let lamps: Vec<[u8; 3]> = (0..n)
+                    .map(|i| {
+                        let t = if n <= 1 { 0.0 } else { i as f64 / n as f64 };
+                        let h = (hue + t * 360.0 * dir_mul).rem_euclid(360.0);
+                        let (r, g, b) = hsv_to_rgb(h, 1.0, 1.0);
+                        [r, g, b]
+                    })
+                    .collect();
+                self.paint_lamps(&lamps);
             }
-            self.keyboard.set_colors_to(&rgb).unwrap();
             hue = (hue + self.live_speed() as f64 * 4.0) % 360.0;
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(if n > 4 { 33 } else { 50 }));
         }
     }
 
-    /// Fast swipe for WDL. The HID path uses 150-step fades; that looks frozen here,
-    /// and rotating four identical zone colors is invisible.
+    /// Fast swipe for WDL. 4-zone uses the original 4-step path; 24-lamp steps
+    /// no faster than the 30fps painter so strips are not skipped.
     fn play_swipe_wdl(&mut self, profile: &Profile, mode: SwipeMode, clean_with_black: bool) {
+        let n = self.lamp_n();
+        if n <= 4 {
+            self.play_swipe_wdl_zones(profile, mode, clean_with_black);
+            return;
+        }
+        let stops = distinct_swipe_colors(profile.rgb_array());
+        let palette = effects::lamps::lamps_from_zones(&stops, n);
+        legion_rgb_driver::debug_log(&format!(
+            "EFFECT: swipe WDL mode={mode:?} lamps={n} step_ms={}",
+            swipe_step_ms(self.live_speed(), n)
+        ));
+        let mut shift = 0usize;
+        while !self.stop_signals.manager_stop_signal.load(Ordering::SeqCst) {
+            match mode {
+                SwipeMode::Change => {
+                    let lamps: Vec<[u8; 3]> = (0..n).map(|i| palette[(i + shift) % n]).collect();
+                    self.paint_lamps(&lamps);
+                    let stride = swipe_stride(self.live_speed(), n);
+                    shift = match profile.direction {
+                        Direction::Left => (shift + n - stride) % n,
+                        Direction::Right => (shift + stride) % n,
+                    };
+                    thread::sleep(Duration::from_millis(swipe_step_ms(self.live_speed(), n)));
+                }
+                SwipeMode::Fill => {
+                    let order: Vec<usize> = match profile.direction {
+                        Direction::Left => (0..n).collect(),
+                        Direction::Right => (0..n).rev().collect(),
+                    };
+                    let colors = [
+                        effects::lamps::zone_rgb(&stops, 0),
+                        effects::lamps::zone_rgb(&stops, 1),
+                        effects::lamps::zone_rgb(&stops, 2),
+                        effects::lamps::zone_rgb(&stops, 3),
+                    ];
+                    for color in colors {
+                        let mut lamps = vec![[0u8; 3]; n];
+                        let mut i = 0usize;
+                        while i < order.len() {
+                            let end = (i + swipe_stride(self.live_speed(), n)).min(order.len());
+                            for &idx in &order[i..end] {
+                                lamps[idx] = color;
+                            }
+                            self.paint_lamps(&lamps);
+                            thread::sleep(Duration::from_millis(swipe_fill_ms(self.live_speed(), n)));
+                            if self.stop_signals.manager_stop_signal.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            i = end;
+                        }
+                        if clean_with_black {
+                            i = 0;
+                            while i < order.len() {
+                                let end = (i + swipe_stride(self.live_speed(), n)).min(order.len());
+                                for &idx in &order[i..end] {
+                                    lamps[idx] = [0; 3];
+                                }
+                                self.paint_lamps(&lamps);
+                                thread::sleep(Duration::from_millis(swipe_fill_ms(self.live_speed(), n)));
+                                if self.stop_signals.manager_stop_signal.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                i = end;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn play_swipe_wdl_zones(&mut self, profile: &Profile, mode: SwipeMode, clean_with_black: bool) {
         let mut colors = distinct_swipe_colors(profile.rgb_array());
-        legion_rgb_driver::debug_log(&format!("EFFECT: swipe WDL mode={mode:?}"));
+        legion_rgb_driver::debug_log(&format!("EFFECT: swipe WDL mode={mode:?} lamps=4"));
         while !self.stop_signals.manager_stop_signal.load(Ordering::SeqCst) {
             match mode {
                 SwipeMode::Change => {
@@ -401,7 +563,7 @@ impl Inner {
                         Direction::Left => colors.rotate_right(3),
                         Direction::Right => colors.rotate_left(3),
                     }
-                    self.keyboard.set_colors_to(&colors).unwrap();
+                    let _ = self.keyboard.set_colors_to(&colors);
                     thread::sleep(Duration::from_millis(wdl_delay_ms(self.live_speed())));
                 }
                 SwipeMode::Fill => {
@@ -415,7 +577,7 @@ impl Inner {
                             frame[dst * 3] = colors[src * 3];
                             frame[dst * 3 + 1] = colors[src * 3 + 1];
                             frame[dst * 3 + 2] = colors[src * 3 + 2];
-                            self.keyboard.set_colors_to(&frame).unwrap();
+                            let _ = self.keyboard.set_colors_to(&frame);
                             thread::sleep(Duration::from_millis(wdl_delay_ms(self.live_speed())));
                             if self.stop_signals.manager_stop_signal.load(Ordering::SeqCst) {
                                 return;
@@ -427,7 +589,8 @@ impl Inner {
         }
     }
 
-    fn play_disco_wdl(&mut self, profile: &Profile, rng: &mut ThreadRng) {
+    fn play_disco_wdl(&mut self, _profile: &Profile, rng: &mut ThreadRng) {
+        let n = self.lamp_n();
         let palette = [
             [255, 0, 0],
             [255, 255, 0],
@@ -436,16 +599,19 @@ impl Inner {
             [0, 0, 255],
             [255, 0, 255],
         ];
-        let mut rgb = profile.rgb_array();
+        let mut lamps = vec![[0u8; 3]; n];
         legion_rgb_driver::debug_log("EFFECT: disco WDL");
-        self.keyboard.set_colors_to(&rgb).unwrap();
+        self.paint_lamps(&lamps);
         while !self.stop_signals.manager_stop_signal.load(Ordering::SeqCst) {
+            for lamp in lamps.iter_mut() {
+                *lamp = effects::lamps::scale_rgb(*lamp, 0.72);
+            }
             let color = palette[rng.random_range(0..palette.len())];
-            let zone = rng.random_range(0..4usize);
-            rgb[zone * 3] = color[0];
-            rgb[zone * 3 + 1] = color[1];
-            rgb[zone * 3 + 2] = color[2];
-            self.keyboard.set_colors_to(&rgb).unwrap();
+            lamps[rng.random_range(0..n)] = color;
+            if n > 4 {
+                lamps[rng.random_range(0..n)] = palette[rng.random_range(0..palette.len())];
+            }
+            self.paint_lamps(&lamps);
             thread::sleep(Duration::from_millis(wdl_delay_ms(self.live_speed())));
         }
     }
@@ -453,8 +619,27 @@ impl Inner {
 
 fn wdl_delay_ms(speed: u8) -> u64 {
     let speed = speed.clamp(1, 10) as u64;
-    // Slider 1 is slow (~400ms/step), 10 is fast (~25ms/step).
     (400 / speed).clamp(25, 400)
+}
+
+fn swipe_step_ms(_speed: u8, _n: usize) -> u64 {
+    // Match the 30fps painter. Faster sleeps just skip strips (the "sudden drop").
+    33
+}
+
+fn swipe_fill_ms(speed: u8, n: usize) -> u64 {
+    swipe_step_ms(speed, n)
+}
+
+fn swipe_stride(speed: u8, n: usize) -> usize {
+    if n <= 4 {
+        return 1;
+    }
+    match speed.clamp(1, 10) {
+        1..=3 => 1,
+        4..=7 => 2,
+        _ => 3,
+    }
 }
 
 fn distinct_swipe_colors(rgb: [u8; 12]) -> [u8; 12] {

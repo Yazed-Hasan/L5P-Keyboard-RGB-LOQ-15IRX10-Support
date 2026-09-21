@@ -1,4 +1,4 @@
-use eframe::egui::{ComboBox, Slider, Ui};
+use eframe::egui::{ComboBox, Label, Sense, Slider, Ui};
 use legion_rgb_driver::SPEED_RANGE;
 use strum::IntoEnumIterator;
 
@@ -9,6 +9,10 @@ use crate::{
 };
 
 const COMBOBOX_WIDTH: f32 = 20.0;
+
+fn tip(resp: eframe::egui::Response, text: &str) -> eframe::egui::Response {
+    resp.on_hover_text(text).on_disabled_hover_text(text)
+}
 
 pub fn show(
     ui: &mut Ui,
@@ -29,40 +33,85 @@ pub fn show(
 
 pub fn show_brightness(ui: &mut Ui, profile: &mut Profile, update_lights: &mut bool, is_dynamic_lighting: bool) {
     if is_dynamic_lighting {
+        let text = "Overall keyboard brightness for this effect.";
         ui.horizontal(|ui| {
-            *update_lights |= ui.add(Slider::new(&mut profile.brightness_level, 1..=100)).changed();
-            ui.label("Brightness");
+            *update_lights |= tip(ui.add(Slider::new(&mut profile.brightness_level, 1..=100)), text).changed();
+            tip(ui.add(Label::new("Brightness").sense(Sense::hover())), text);
+            tip(ui.small_button("?"), text);
+            if tip(
+                ui.add_enabled(profile.brightness_level != 50, eframe::egui::Button::new("↺")),
+                "Reset this setting to default",
+            )
+            .clicked()
+            {
+                profile.brightness_level = 50;
+                *update_lights = true;
+            }
         });
     } else {
-        ComboBox::from_label("Brightness")
-            .width(COMBOBOX_WIDTH)
-            .selected_text({
-                let text: &'static str = profile.brightness.into();
-                text
-            })
-            .show_ui(ui, |ui| {
-                for val in Brightness::iter() {
-                    let text: &'static str = val.into();
-                    *update_lights |= ui.selectable_value(&mut profile.brightness, val, text).changed();
-                }
-            });
+        let text = "Firmware brightness steps. Software effects use the slider instead.";
+        ui.horizontal(|ui| {
+            tip(
+                ComboBox::from_label("Brightness")
+                    .width(COMBOBOX_WIDTH)
+                    .selected_text({
+                        let text: &'static str = profile.brightness.into();
+                        text
+                    })
+                    .show_ui(ui, |ui| {
+                        for val in Brightness::iter() {
+                            let name: &'static str = val.into();
+                            *update_lights |= ui.selectable_value(&mut profile.brightness, val, name).changed();
+                        }
+                    })
+                    .response,
+                text,
+            );
+            tip(ui.small_button("?"), text);
+            if tip(
+                ui.add_enabled(profile.brightness != Brightness::Low, eframe::egui::Button::new("↺")),
+                "Reset this setting to default",
+            )
+            .clicked()
+            {
+                profile.brightness = Brightness::Low;
+                *update_lights = true;
+            }
+        });
     }
 }
 
 pub fn show_direction(ui: &mut Ui, profile: &mut Profile, update_lights: &mut bool) {
     ui.add_enabled_ui(profile.effect.takes_direction(), |ui| {
-        ComboBox::from_label("Direction")
-            .width(COMBOBOX_WIDTH)
-            .selected_text({
-                let text: &'static str = profile.direction.into();
-                text
-            })
-            .show_ui(ui, |ui| {
-                for val in Direction::iter() {
-                    let text: &'static str = val.into();
-                    *update_lights |= ui.selectable_value(&mut profile.direction, val, text).changed();
-                }
-            });
+        let text = "Which way Wave and Swipe travel across the four zones.";
+        ui.horizontal(|ui| {
+            tip(
+                ComboBox::from_label("Direction")
+                    .width(COMBOBOX_WIDTH)
+                    .selected_text({
+                        let text: &'static str = profile.direction.into();
+                        text
+                    })
+                    .show_ui(ui, |ui| {
+                        for val in Direction::iter() {
+                            let name: &'static str = val.into();
+                            *update_lights |= ui.selectable_value(&mut profile.direction, val, name).changed();
+                        }
+                    })
+                    .response,
+                text,
+            );
+            tip(ui.small_button("?"), text);
+            if tip(
+                ui.add_enabled(profile.direction != Direction::Left, eframe::egui::Button::new("↺")),
+                "Reset this setting to default",
+            )
+            .clicked()
+            {
+                profile.direction = Direction::Left;
+                *update_lights = true;
+            }
+        });
     });
 }
 
@@ -80,10 +129,13 @@ pub fn show_effect_settings(
         SPEED_RANGE
     };
 
+    let text = "How fast the effect animates. Higher is quicker. Applies live for software lighting.";
     ui.horizontal(|ui| {
-        let changed = ui
-            .add_enabled(profile.effect.takes_speed(), Slider::new(&mut profile.speed, range))
-            .changed();
+        let changed = tip(
+            ui.add_enabled(profile.effect.takes_speed(), Slider::new(&mut profile.speed, range)),
+            text,
+        )
+        .changed();
         if changed {
             if is_dynamic_lighting {
                 *live_speed = Some(profile.speed);
@@ -91,6 +143,20 @@ pub fn show_effect_settings(
                 *update_lights = true;
             }
         }
-        ui.label("Speed");
+        tip(ui.add(Label::new("Speed").sense(Sense::hover())), text);
+        tip(ui.small_button("?"), text);
+        if tip(
+            ui.add_enabled(profile.effect.takes_speed() && profile.speed != 1, eframe::egui::Button::new("↺")),
+            "Reset this setting to default",
+        )
+        .clicked()
+        {
+            profile.speed = 1;
+            if is_dynamic_lighting {
+                *live_speed = Some(1);
+            } else {
+                *update_lights = true;
+            }
+        }
     });
 }

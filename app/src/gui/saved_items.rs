@@ -12,6 +12,9 @@ pub struct SavedItems {
 
     tab: Tab,
     new_item_name: String,
+    request_save_as: bool,
+    just_saved_profile: bool,
+    just_saved_custom: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -27,12 +30,22 @@ impl SavedItems {
             custom_effects,
             tab: Tab::Profiles,
             new_item_name: String::default(),
+            request_save_as: false,
+            just_saved_profile: false,
+            just_saved_custom: false,
         }
     }
 
     fn setup_modal<T: Clone>(
-        ctx: &Context, id_source: &str, item_name: &str, new_item_name: &mut String, items: &mut Vec<T>, current_item: &mut T, item_name_extractor: fn(&T) -> Option<String>,
+        ctx: &Context,
+        id_source: &str,
+        item_name: &str,
+        new_item_name: &mut String,
+        items: &mut Vec<T>,
+        current_item: &mut T,
+        item_name_extractor: fn(&T) -> Option<String>,
         item_name_setter: fn(&mut T, String),
+        saved_flag: &mut bool,
     ) -> Modal {
         let modal = Modal::new(ctx, id_source);
 
@@ -52,6 +65,7 @@ impl SavedItems {
                     if modal.button(ui, "Save").clicked() {
                         item_name_setter(current_item, new_item_name.clone());
                         items.push(current_item.clone());
+                        *saved_flag = true;
                     };
                 });
 
@@ -76,6 +90,7 @@ impl SavedItems {
             current_profile,
             |prof| prof.name.clone(),
             |prof, name| prof.name = Some(name),
+            &mut self.just_saved_profile,
         )
     }
 
@@ -89,7 +104,31 @@ impl SavedItems {
             &mut loaded_effect.effect,
             |effect| effect.name.clone(),
             |effect, name| effect.name = Some(name),
+            &mut self.just_saved_custom,
         )
+    }
+
+    pub fn request_save_as(&mut self) {
+        self.new_item_name.clear();
+        self.request_save_as = true;
+    }
+
+    pub fn upsert_named_profile(&mut self, profile: &Profile) -> bool {
+        let Some(name) = profile.name.as_ref() else {
+            return false;
+        };
+        if let Some(slot) = self.profiles.iter_mut().find(|item| item.name.as_ref() == Some(name)) {
+            *slot = profile.clone();
+        } else {
+            self.profiles.push(profile.clone());
+        }
+        true
+    }
+
+    pub fn take_just_saved(&mut self) -> bool {
+        let saved = self.just_saved_profile;
+        self.just_saved_profile = false;
+        saved
     }
 
     pub fn show_header(&mut self, ctx: &Context, ui: &mut Ui, current_profile: &mut Profile, loaded_effect: &mut LoadedEffect) {
@@ -101,12 +140,20 @@ impl SavedItems {
 
         match self.tab {
             Tab::Profiles => {
-                if ui.button("+").clicked() {
+                if ui.button("Save as").on_hover_text("Save the current lighting as a named profile.").clicked() {
                     self.new_item_name.clear();
                     profile_modal.open();
                 }
-                if ui.button("-").clicked() {
-                    self.profiles.retain(|prof| prof != current_profile);
+                if self.request_save_as {
+                    self.request_save_as = false;
+                    self.new_item_name.clear();
+                    profile_modal.open();
+                }
+                if ui.button("-").on_hover_text("Delete the selected named profile.").clicked() {
+                    if let Some(name) = current_profile.name.clone() {
+                        self.profiles.retain(|prof| prof.name.as_ref() != Some(&name));
+                        current_profile.name = None;
+                    }
                 }
             }
             Tab::CustomEffects => {
@@ -144,12 +191,18 @@ impl SavedItems {
                             ui.centered_and_justified(|ui| ui.label("No profiles added"));
                         } else {
                             ui.horizontal_wrapped(|ui| {
-                                for prof in self.profiles.iter() {
+                                let mut load_idx = None;
+                                for (idx, prof) in self.profiles.iter().enumerate() {
                                     let name = prof.name.as_deref().unwrap_or("Unnamed");
-                                    if ui.selectable_value(current_profile, prof.clone(), name).clicked() {
-                                        *changed = true;
-                                        loaded_effect.state = State::None;
-                                    };
+                                    let selected = current_profile.name.is_some() && current_profile.name == prof.name;
+                                    if ui.selectable_label(selected, name).clicked() {
+                                        load_idx = Some(idx);
+                                    }
+                                }
+                                if let Some(idx) = load_idx {
+                                    *current_profile = self.profiles[idx].clone();
+                                    *changed = true;
+                                    loaded_effect.state = State::None;
                                 }
                             });
                         }

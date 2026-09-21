@@ -60,6 +60,14 @@ winapi = { version = "0.3.9", features = ["consoleapi", "wincon", "processenv", 
 # Tray icon
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.19"
+windows = { version = "0.61", features = [
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Power",
+] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 tray-icon = { version = "0.20.1", default-features = false }

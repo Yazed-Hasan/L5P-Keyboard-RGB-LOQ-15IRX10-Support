@@ -9,7 +9,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub mod error;
@@ -339,6 +339,19 @@ fn set_controlled_by_foreground_app(enabled: bool) {
     let _ = reg_add_dword(r"HKCU\Software\Microsoft\Lighting", "ControlledByForegroundApp", value);
     for device_key in reg_query_subkeys(r"HKCU\Software\Microsoft\Lighting\Devices") {
         let _ = reg_add_dword(&device_key, "ControlledByForegroundApp", value);
+    }
+}
+
+/// Stop Windows/Legion from painting when this process is not the foreground
+/// lighting app. HID feature reports stay in control either way.
+#[cfg(target_os = "windows")]
+fn keep_app_exclusive_lighting() {
+    let _ = reg_add_dword(r"HKCU\Software\Microsoft\Lighting", "AmbientLightingEnabled", 0);
+    let _ = reg_add_dword(r"HKCU\Software\Microsoft\Lighting", "UseSystemAccentColor", 0);
+    set_controlled_by_foreground_app(false);
+    for device_key in reg_query_subkeys(r"HKCU\Software\Microsoft\Lighting\Devices") {
+        let _ = reg_add_dword(&device_key, "AmbientLightingEnabled", 0);
+        let _ = reg_add_dword(&device_key, "UseSystemAccentColor", 0);
     }
 }
 
@@ -1554,14 +1567,118 @@ enum Protocol {
     },
 }
 
+pub const MAX_LAMPS: usize = 24;
+pub const LAMP_ROWS: usize = 6;
+pub const LAMP_ZONES: usize = 4;
+
+pub fn lamp_index(zone: usize, row: usize) -> usize {
+    zone * LAMP_ROWS + row
+}
+
+pub fn expand_zones_to_lamps(rgb: &[u8; 12], lamp_count: usize) -> Vec<[u8; 3]> {
+    let lc = lamp_count.max(1).min(MAX_LAMPS);
+    let zones = LAMP_ZONES.min(lc);
+    (0..lc)
+        .map(|i| {
+            let z = (i * zones / lc).min(zones.saturating_sub(1));
+            [rgb[z * 3], rgb[z * 3 + 1], rgb[z * 3 + 2]]
+        })
+        .collect()
+}
+
+pub fn pack_lamp_rgb(lamps: &[[u8; 3]]) -> [u8; 72] {
+    let mut out = [0u8; 72];
+    for (i, color) in lamps.iter().take(MAX_LAMPS).enumerate() {
+        out[i * 3] = color[0];
+        out[i * 3 + 1] = color[1];
+        out[i * 3 + 2] = color[2];
+    }
+    out
+}
+
+pub fn unpack_lamp_rgb(bytes: &[u8], lamp_count: usize) -> Vec<[u8; 3]> {
+    let lc = lamp_count.min(MAX_LAMPS);
+    (0..lc)
+        .map(|i| {
+            let o = i * 3;
+            if o + 2 < bytes.len() {
+                [bytes[o], bytes[o + 1], bytes[o + 2]]
+            } else {
+                [0, 0, 0]
+            }
+        })
+        .collect()
+}
+
+pub fn zone_colors_from_lamps(lamps: &[[u8; 3]]) -> [u8; 12] {
+    let mut rgb = [0u8; 12];
+    let lc = lamps.len().max(1);
+    let zones = LAMP_ZONES.min(lc);
+    for z in 0..zones {
+        let start = (z * lc) / zones;
+        let end = ((z + 1) * lc) / zones;
+        let n = (end.saturating_sub(start)).max(1) as u32;
+        let mut r = 0u32;
+        let mut g = 0u32;
+        let mut b = 0u32;
+        for lamp in lamps.iter().take(end).skip(start) {
+            r += lamp[0] as u32;
+            g += lamp[1] as u32;
+            b += lamp[2] as u32;
+        }
+        rgb[z * 3] = (r / n) as u8;
+        rgb[z * 3 + 1] = (g / n) as u8;
+        rgb[z * 3 + 2] = (b / n) as u8;
+    }
+    rgb
+}
+
+fn resolved_lamps(rgb: &[u8; 12], lamp_rgb: &[u8], per_lamp: bool, lamp_count: u16) -> Vec<[u8; 3]> {
+    if per_lamp {
+        unpack_lamp_rgb(lamp_rgb, lamp_count as usize)
+    } else {
+        expand_zones_to_lamps(rgb, lamp_count as usize)
+    }
+}
+
+fn is_vivid_lamps(lamps: &[[u8; 3]]) -> bool {
+    lamps.iter().any(|c| c.iter().any(|v| *v >= 24))
+}
+
+fn blank_lighting(brightness: u8) -> LightingState {
+    LightingState {
+        effect_type: BaseEffects::Static,
+        speed: 1,
+        brightness,
+        rgb_values: [0; 12],
+        lamp_rgb: [0; 72],
+        per_lamp: false,
+    }
+}
+
 /// Shared color state for the Windows Dynamic Lighting effect callback.
 #[cfg(target_os = "windows")]
 struct WinLampColors {
     rgb_values: [u8; 12],
+    lamp_rgb: [u8; 72],
+    per_lamp: bool,
     brightness: u8,
     speed: u8,
     effect_type: BaseEffects,
     lamp_count: u16,
+}
+
+#[cfg(target_os = "windows")]
+fn blank_win_colors(brightness: u8, lamp_count: u16) -> WinLampColors {
+    WinLampColors {
+        rgb_values: [0; 12],
+        lamp_rgb: [0; 72],
+        per_lamp: false,
+        brightness,
+        speed: 1,
+        effect_type: BaseEffects::Static,
+        lamp_count,
+    }
 }
 
 pub const SPEED_RANGE: std::ops::RangeInclusive<u8> = 1..=4;
@@ -1583,6 +1700,8 @@ pub struct LightingState {
     speed: u8,
     brightness: u8,
     rgb_values: [u8; 12],
+    lamp_rgb: [u8; 72],
+    per_lamp: bool,
 }
 
 pub struct Keyboard {
@@ -1657,75 +1776,63 @@ impl Keyboard {
                 if let Some(ref shared) = self.win_color_state {
                     let mut state = shared.lock().unwrap();
                     state.rgb_values = self.current_state.rgb_values;
+                    state.lamp_rgb = self.current_state.lamp_rgb;
+                    state.per_lamp = self.current_state.per_lamp;
                     state.brightness = self.current_state.brightness;
                     state.speed = self.current_state.speed;
                     state.effect_type = self.current_state.effect_type;
                 }
 
-                // Direct write as backup for when effect playlist is paused (app backgrounded)
-                if let Ok(guard) = self.win_lamp_array.lock() {
-                    if let Some(ref lamp_array) = *guard {
-                    let colors = &self.current_state.rgb_values;
-                    let lc = lamp_count as usize;
-                    let zones = std::cmp::min(4, lc);
-                    let intensity = (self.current_state.brightness as f64 / 100.0).clamp(0.01, 1.0);
-
-                    for z in 0..zones {
-                        let zone_start = (z * lc) / zones;
-                        let zone_end = ((z + 1) * lc) / zones;
-                        if zone_start >= zone_end { continue; }
-                        let r = (colors[z * 3] as f64 * intensity) as u8;
-                        let g = (colors[z * 3 + 1] as f64 * intensity) as u8;
-                        let b = (colors[z * 3 + 2] as f64 * intensity) as u8;
-                        let color = Color { A: 255, R: r, G: g, B: b };
-                        let indices: Vec<i32> = (zone_start..zone_end).map(|i| i as i32).collect();
-                        let _ = lamp_array.SetSingleColorForIndices(color, &indices);
-                    }
-                    }
-                }
-
+                // Keepalive is the only hardware painter for 4-zone and 24-lamp.
+                // Wave/Swipe used to hitch because refresh() also pushed WinRT here.
+                let _ = lamp_count;
                 Ok(())
             }
             Protocol::LampArrayHid { report_ids, lamp_count } => {
                 let device = self.hid_device();
-                let colors = &self.current_state.rgb_values;
+                let lamps = resolved_lamps(
+                    &self.current_state.rgb_values,
+                    &self.current_state.lamp_rgb,
+                    self.current_state.per_lamp,
+                    lamp_count,
+                );
                 let intensity = match self.current_state.brightness {
                     1 => 128u8,
                     _ => 255u8,
                 };
-                let zones = std::cmp::min(4, lamp_count as usize);
-
-                // Build LampMultiUpdateReport (HID Usage 0x50)
-                // Layout: [report_id, lamp_count, flags, lamp_ids×8 (u16 LE), colors×8 (RGBI)]
-                let mut buf = [0u8; 51];
-                buf[0] = report_ids.multi_update;
-                buf[1] = zones as u8;
-                buf[2] = 0x01; // flags: lampUpdateComplete
-
-                // Lamp IDs (u16 LE, 8 slots starting at byte 3)
-                for z in 0..zones {
-                    buf[3 + z * 2] = z as u8;
+                #[cfg(target_os = "windows")]
+                {
+                    write_lamp_array_lamps(device, &report_ids, lamp_count, &lamps, intensity);
                 }
-                // Colors (RGBI, 8 slots starting at byte 19)
-                for z in 0..zones {
-                    let co = 19 + z * 4;
-                    let ro = z * 3;
-                    buf[co] = colors[ro];           // Red
-                    buf[co + 1] = colors[ro + 1];   // Green
-                    buf[co + 2] = colors[ro + 2];   // Blue
-                    buf[co + 3] = intensity;         // Intensity
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let zones = std::cmp::min(4, lamp_count as usize);
+                    let colors = &self.current_state.rgb_values;
+                    let mut buf = [0u8; 51];
+                    buf[0] = report_ids.multi_update;
+                    buf[1] = zones as u8;
+                    buf[2] = 0x01;
+                    for z in 0..zones {
+                        buf[3 + z * 2] = z as u8;
+                    }
+                    for z in 0..zones {
+                        let co = 19 + z * 4;
+                        let ro = z * 3;
+                        buf[co] = colors[ro];
+                        buf[co + 1] = colors[ro + 1];
+                        buf[co + 2] = colors[ro + 2];
+                        buf[co + 3] = intensity;
+                    }
+                    device.write(&buf)?;
                 }
-
-                #[cfg(debug_assertions)]
-                eprintln!("[DEBUG] LampArray HID: sending MultiUpdate ({} zones, intensity={})", zones, intensity);
-
-                device.write(&buf)?;
                 Ok(())
             }
             Protocol::LampArrayHidManaged => {
                 if let Some(ref shared) = self.win_color_state {
                     let mut state = shared.lock().unwrap();
                     state.rgb_values = self.current_state.rgb_values;
+                    state.lamp_rgb = self.current_state.lamp_rgb;
+                    state.per_lamp = self.current_state.per_lamp;
                     state.brightness = self.current_state.brightness;
                     state.speed = self.current_state.speed;
                     state.effect_type = self.current_state.effect_type;
@@ -1853,6 +1960,7 @@ impl Keyboard {
             let full_index = (zone_index * 3 + i as u8) as usize;
             self.current_state.rgb_values[full_index] = new_values[i];
         }
+        self.remember_zone_colors();
         self.refresh()?;
 
         Ok(())
@@ -1863,10 +1971,52 @@ impl Keyboard {
             for (i, _) in new_values.iter().enumerate() {
                 self.current_state.rgb_values[i] = new_values[i];
             }
+            self.remember_zone_colors();
             self.refresh()?;
         }
 
         Ok(())
+    }
+
+    pub fn set_lamp_colors(&mut self, colors: &[[u8; 3]]) -> Result<()> {
+        if colors.is_empty() {
+            return self.set_colors_to(&[0; 12]);
+        }
+        let lamps: Vec<[u8; 3]> = colors.iter().copied().take(MAX_LAMPS).collect();
+        let packed = pack_lamp_rgb(&lamps);
+        if self.current_state.per_lamp && self.current_state.lamp_rgb == packed {
+            return Ok(());
+        }
+        self.current_state.lamp_rgb = packed;
+        self.current_state.per_lamp = true;
+        self.current_state.rgb_values = zone_colors_from_lamps(&lamps);
+        self.refresh()
+    }
+
+    pub fn lamp_count(&self) -> u16 {
+        match self.protocol {
+            Protocol::LampArrayHid { lamp_count, .. } => lamp_count.max(1),
+            #[cfg(target_os = "windows")]
+            Protocol::WindowsDynamicLighting { lamp_count } => lamp_count.max(1),
+            Protocol::LampArrayHidManaged => {
+                #[cfg(target_os = "windows")]
+                {
+                    if let Some(ref shared) = self.win_color_state {
+                        if let Ok(state) = shared.lock() {
+                            return state.lamp_count.max(1);
+                        }
+                    }
+                }
+                MAX_LAMPS as u16
+            }
+            Protocol::Legacy(_) => 4,
+        }
+    }
+
+    fn remember_zone_colors(&mut self) {
+        self.current_state.per_lamp = false;
+        let lamps = expand_zones_to_lamps(&self.current_state.rgb_values, self.lamp_count() as usize);
+        self.current_state.lamp_rgb = pack_lamp_rgb(&lamps);
     }
 
     pub fn solid_set_colors_to(&mut self, new_values: [u8; 3]) -> Result<()> {
@@ -1876,6 +2026,7 @@ impl Keyboard {
                 self.current_state.rgb_values[i + 1] = new_values[1];
                 self.current_state.rgb_values[i + 2] = new_values[2];
             }
+            self.remember_zone_colors();
             self.refresh()?;
         }
 
@@ -1898,6 +2049,7 @@ impl Keyboard {
                         new_values[index] += color_differences[index];
                     }
                     self.current_state.rgb_values = new_values.map(|val| val as u8);
+                    self.remember_zone_colors();
 
                     self.refresh()?;
                     thread::sleep(Duration::from_millis(delay_between_steps));
@@ -2156,22 +2308,11 @@ fn try_lamp_array_keyboard(api: &HidApi, stop_signal: &Arc<AtomicBool>) -> Optio
     }
     log_to_file("try_lamp_array_keyboard: host control acquired");
 
-    let current_state = LightingState {
-        effect_type: BaseEffects::Static,
-        speed: 1,
-        brightness: if is_loq_15irx10 { 50 } else { 1 },
-        rgb_values: [0; 12],
-    };
+    let current_state = blank_lighting(if is_loq_15irx10 { 50 } else { 1 });
 
     #[cfg(target_os = "windows")]
     let raw_keepalive_state = if is_loq_15irx10 {
-        Some(Arc::new(std::sync::Mutex::new(WinLampColors {
-            rgb_values: [0; 12],
-            brightness: 50,
-            speed: 1,
-            effect_type: BaseEffects::Static,
-            lamp_count,
-        })))
+        Some(Arc::new(std::sync::Mutex::new(blank_win_colors(50, lamp_count))))
     } else {
         None
     };
@@ -2240,12 +2381,7 @@ fn try_loq_vendor_keyboard(api: &HidApi, stop_signal: &Arc<AtomicBool>) -> Optio
         }
     };
 
-    let current_state = LightingState {
-        effect_type: BaseEffects::Static,
-        speed: 1,
-        brightness: 1,
-        rgb_values: [0; 12],
-    };
+    let current_state = blank_lighting(1);
 
     let mut keyboard = Keyboard {
         keyboard_hid: Some(device),
@@ -2339,15 +2475,146 @@ fn open_raw_lamp_array_hid(known_lamp_count: u16) -> Option<(HidDevice, LampArra
 
 #[cfg(target_os = "windows")]
 fn send_lamp_array_feature(device: &HidDevice, payload: &[u8]) -> std::result::Result<(), hidapi::HidError> {
+    // Windows HID requires the buffer to match FeatureReportByteLength (65 on this ITE).
     let mut buf = [0u8; 65];
     let n = payload.len().min(buf.len());
     buf[..n].copy_from_slice(&payload[..n]);
     device.send_feature_report(&buf).map(|_| ())
 }
 
-/// Paint every lamp by expanding the 4 zone colors. This keyboard only accepts
-/// HID LampArray *feature* reports (IDs 4/5/6). Output writes are ignored.
+fn pace_keepalive_frame(started: Instant) {
+    // 24-lamp at 16ms flooded ITE SetFeature (~180 reports/s) and the keyboard
+    // dropped frames. Pre-24-mode keepalive was ~30fps.
+    if let Some(remain) = Duration::from_millis(33).checked_sub(started.elapsed()) {
+        thread::sleep(remain);
+    }
+}
+
 #[cfg(target_os = "windows")]
+fn count_color_runs(lamps: &[[u8; 3]], lc: usize) -> usize {
+    let mut runs = 0usize;
+    let mut i = 0usize;
+    while i < lc {
+        let color = lamps[i];
+        i += 1;
+        runs += 1;
+        while i < lc && lamps[i] == color {
+            i += 1;
+        }
+    }
+    runs
+}
+
+/// Paint every lamp. 1–2 color runs use range reports; Wave/Swipe (3+ colors)
+/// always use 8-lamp multi-update so 4-zone and 24-lamp share the same 3-report path.
+#[cfg(target_os = "windows")]
+fn write_lamp_array_lamps(
+    device: &HidDevice,
+    report_ids: &LampArrayReportIds,
+    lamp_count: u16,
+    lamps: &[[u8; 3]],
+    intensity: u8,
+) {
+    let _ = write_lamp_array_lamps_timed(device, report_ids, lamp_count, lamps, intensity);
+}
+
+#[cfg(target_os = "windows")]
+fn write_lamp_array_lamps_timed(
+    device: &HidDevice,
+    report_ids: &LampArrayReportIds,
+    lamp_count: u16,
+    lamps: &[[u8; 3]],
+    intensity: u8,
+) -> (usize, usize, u128) {
+    let started = Instant::now();
+    let lc = (lamp_count.max(1) as usize).min(lamps.len()).min(MAX_LAMPS);
+    let intensity = if intensity == 0 { 1 } else { intensity };
+    if lc == 0 {
+        return (0, 0, 0);
+    }
+
+    let runs = count_color_runs(lamps, lc);
+    let mut reports = 0usize;
+
+    if report_ids.range_update != 0 && runs <= 4 {
+        let mut start = 0usize;
+        while start < lc {
+            let color = lamps[start];
+            let mut end = start + 1;
+            while end < lc && lamps[end] == color {
+                end += 1;
+            }
+            let start_id = start as u16;
+            let end_id = (end - 1) as u16;
+            let buf = [
+                report_ids.range_update,
+                if end >= lc { 0x01 } else { 0x00 },
+                start_id as u8,
+                (start_id >> 8) as u8,
+                end_id as u8,
+                (end_id >> 8) as u8,
+                color[0],
+                color[1],
+                color[2],
+                intensity,
+            ];
+            let _ = send_lamp_array_feature(device, &buf);
+            reports += 1;
+            start = end;
+        }
+    } else if report_ids.multi_update != 0 {
+        let mut lamp = 0usize;
+        while lamp < lc {
+            let chunk = std::cmp::min(8, lc - lamp);
+            let complete = lamp + chunk >= lc;
+            let mut buf = [0u8; 51];
+            buf[0] = report_ids.multi_update;
+            buf[1] = chunk as u8;
+            buf[2] = if complete { 0x01 } else { 0x00 };
+            for i in 0..chunk {
+                let id = (lamp + i) as u16;
+                buf[3 + i * 2] = id as u8;
+                buf[4 + i * 2] = (id >> 8) as u8;
+                let color = lamps[lamp + i];
+                let co = 19 + i * 4;
+                buf[co] = color[0];
+                buf[co + 1] = color[1];
+                buf[co + 2] = color[2];
+                buf[co + 3] = intensity;
+            }
+            let _ = send_lamp_array_feature(device, &buf);
+            reports += 1;
+            lamp += chunk;
+        }
+    }
+
+    let hid_ms = started.elapsed().as_millis();
+    log_paint_timing(hid_ms, reports, runs, lc);
+    (reports, runs, hid_ms)
+}
+
+#[cfg(target_os = "windows")]
+fn log_paint_timing(hid_ms: u128, reports: usize, runs: usize, lamps: usize) {
+    if hid_ms < 20 {
+        return;
+    }
+    thread_local! {
+        static LAST_SLOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    }
+    let due = LAST_SLOW.with(|t| match t.get() {
+        Some(prev) => prev.elapsed() >= Duration::from_millis(2000),
+        None => true,
+    });
+    if due {
+        LAST_SLOW.with(|t| t.set(Some(Instant::now())));
+        log_to_file(&format!(
+            "PAINT: slow hid_ms={hid_ms} reports={reports} runs={runs} lamps={lamps}"
+        ));
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn write_lamp_array_zones(
     device: &HidDevice,
     report_ids: &LampArrayReportIds,
@@ -2355,58 +2622,111 @@ fn write_lamp_array_zones(
     rgb: &[u8; 12],
     intensity: u8,
 ) {
-    let lc = lamp_count.max(1) as usize;
-    let zones = std::cmp::min(4, lc);
-    let intensity = if intensity == 0 { 1 } else { intensity };
+    let lamps = expand_zones_to_lamps(rgb, lamp_count as usize);
+    write_lamp_array_lamps(device, report_ids, lamp_count, &lamps, intensity);
+}
 
-    if report_ids.range_update != 0 {
-        for z in 0..zones {
-            let start = (z * lc) / zones;
-            let end_excl = ((z + 1) * lc) / zones;
-            if start >= end_excl {
-                continue;
+#[cfg(target_os = "windows")]
+fn scaled_wdl_colors(lamps: &[[u8; 3]], intensity: f64) -> (Vec<Color>, Vec<i32>) {
+    let colors = lamps
+        .iter()
+        .map(|c| Color {
+            A: 255,
+            R: (c[0] as f64 * intensity) as u8,
+            G: (c[1] as f64 * intensity) as u8,
+            B: (c[2] as f64 * intensity) as u8,
+        })
+        .collect();
+    let indices: Vec<i32> = (0..lamps.len() as i32).collect();
+    (colors, indices)
+}
+
+#[cfg(target_os = "windows")]
+fn paint_wdl_chunks<F>(colors: &[Color], indices: &[i32], mut set_chunk: F)
+where
+    F: FnMut(&[Color], &[i32]) -> bool,
+{
+    if colors.is_empty() || colors.len() != indices.len() {
+        return;
+    }
+    if set_chunk(colors, indices) {
+        return;
+    }
+    let mut i = 0usize;
+    while i < colors.len() {
+        let end = (i + 8).min(colors.len());
+        let _ = set_chunk(&colors[i..end], &indices[i..end]);
+        i = end;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn paint_lamp_array(lamp_array: &LampArray, lamps: &[[u8; 3]], intensity: f64) -> bool {
+    let lc = lamps.len();
+    if lc == 0 {
+        return false;
+    }
+    // Pre-24-mode 4-zone path: one SetSingleColorForIndices per zone range.
+    // Pushing 24 unique colors made Wave hitch even with 24-lamp mode off.
+    if count_color_runs(lamps, lc) <= 4 {
+        let mut ok = false;
+        let mut i = 0usize;
+        while i < lc {
+            let color = lamps[i];
+            let start = i;
+            i += 1;
+            while i < lc && lamps[i] == color {
+                i += 1;
             }
-            let start_id = start as u16;
-            let end_id = (end_excl - 1) as u16;
-            let buf = [
-                report_ids.range_update,
-                if z + 1 == zones { 0x01 } else { 0x00 },
-                start_id as u8,
-                (start_id >> 8) as u8,
-                end_id as u8,
-                (end_id >> 8) as u8,
-                rgb[z * 3],
-                rgb[z * 3 + 1],
-                rgb[z * 3 + 2],
-                intensity,
-            ];
-            let _ = send_lamp_array_feature(device, &buf);
+            let wdl = Color {
+                A: 255,
+                R: (color[0] as f64 * intensity) as u8,
+                G: (color[1] as f64 * intensity) as u8,
+                B: (color[2] as f64 * intensity) as u8,
+            };
+            let indices: Vec<i32> = (start as i32..i as i32).collect();
+            ok |= lamp_array.SetSingleColorForIndices(wdl, &indices).is_ok();
+        }
+        return ok;
+    }
+    let (colors, indices) = scaled_wdl_colors(lamps, intensity);
+    let mut ok = false;
+    paint_wdl_chunks(&colors, &indices, |c, i| {
+        let success = lamp_array.SetColorsForIndices(c, i).is_ok();
+        ok |= success;
+        success
+    });
+    ok
+}
+
+#[cfg(target_os = "windows")]
+fn paint_lamp_array_args(args: &LampArrayUpdateRequestedEventArgs, lamps: &[[u8; 3]], intensity: f64) {
+    let lc = lamps.len();
+    if lc == 0 {
+        return;
+    }
+    if count_color_runs(lamps, lc) <= 4 {
+        let mut i = 0usize;
+        while i < lc {
+            let color = lamps[i];
+            let start = i;
+            i += 1;
+            while i < lc && lamps[i] == color {
+                i += 1;
+            }
+            let wdl = Color {
+                A: 255,
+                R: (color[0] as f64 * intensity) as u8,
+                G: (color[1] as f64 * intensity) as u8,
+                B: (color[2] as f64 * intensity) as u8,
+            };
+            let indices: Vec<i32> = (start as i32..i as i32).collect();
+            let _ = args.SetSingleColorForIndices(wdl, &indices);
         }
         return;
     }
-
-    let mut lamp = 0usize;
-    while lamp < lc {
-        let chunk = std::cmp::min(8, lc - lamp);
-        let complete = lamp + chunk >= lc;
-        let mut buf = [0u8; 51];
-        buf[0] = report_ids.multi_update;
-        buf[1] = chunk as u8;
-        buf[2] = if complete { 0x01 } else { 0x00 };
-        for i in 0..chunk {
-            let id = (lamp + i) as u16;
-            buf[3 + i * 2] = id as u8;
-            buf[4 + i * 2] = (id >> 8) as u8;
-            let z = std::cmp::min((lamp + i) * zones / lc, zones.saturating_sub(1));
-            let co = 19 + i * 4;
-            buf[co] = rgb[z * 3];
-            buf[co + 1] = rgb[z * 3 + 1];
-            buf[co + 2] = rgb[z * 3 + 2];
-            buf[co + 3] = intensity;
-        }
-        let _ = send_lamp_array_feature(device, &buf);
-        lamp += chunk;
-    }
+    let (colors, indices) = scaled_wdl_colors(lamps, intensity);
+    paint_wdl_chunks(&colors, &indices, |c, i| args.SetColorsForIndices(c, i).is_ok());
 }
 
 #[cfg(target_os = "windows")]
@@ -2551,11 +2871,16 @@ fn spawn_raw_hid_keepalive(
         }
 
         let mut last_non_black_rgb = [0u8; 12];
+        let mut last_hid_lamps: Option<Vec<[u8; 3]>> = None;
+        let mut last_hid_intensity: Option<u8> = None;
         loop {
-            let (rgb_values, brightness, speed, effect_type, lamp_count) = {
+            let frame_started = Instant::now();
+            let (rgb_values, lamp_rgb, per_lamp, brightness, speed, effect_type, lamp_count) = {
                 let state = shared_state.lock().unwrap();
                 (
                     state.rgb_values,
+                    state.lamp_rgb,
+                    state.per_lamp,
                     state.brightness,
                     state.speed,
                     state.effect_type,
@@ -2570,22 +2895,27 @@ fn spawn_raw_hid_keepalive(
             } else {
                 last_non_black_rgb
             };
+            let paint_lamps = resolved_lamps(&rgb_values, &lamp_rgb, per_lamp, lamp_count);
 
             let window_is_active = window_active.load(Ordering::Relaxed);
             let _ = window_is_active;
 
             if !skip_lamparray {
                 let intensity = ((brightness.clamp(1, 100) as u16 * 255) / 100) as u8;
-                write_lamp_array_zones(&device, &report_ids, lamp_count, &rgb_values, intensity);
+                let hid_changed = last_hid_lamps.as_ref() != Some(&paint_lamps) || last_hid_intensity != Some(intensity);
+                if hid_changed || tick % 16 == 0 {
+                    write_lamp_array_lamps(&device, &report_ids, lamp_count, &paint_lamps, intensity);
+                    last_hid_lamps = Some(paint_lamps.clone());
+                    last_hid_intensity = Some(intensity);
+                }
 
-                if report_ids.control != 0 {
+                if report_ids.control != 0 && tick % 200 == 0 {
                     let ctrl = [report_ids.control, 0x00];
-                    let _ = device.send_feature_report(&ctrl);
-                    let _ = device.write(&ctrl);
+                    let _ = send_lamp_array_feature(&device, &ctrl);
                 }
             }
 
-            if !vendor_hids.is_empty() {
+            if !vendor_hids.is_empty() && !per_lamp {
                 let legacy_brightness: u8 = if brightness > 50 { 2 } else { 1 };
                 let mut payload = [0u8; 33];
                 payload[0] = 0xcc;
@@ -2848,7 +3178,7 @@ fn spawn_raw_hid_keepalive(
                 ));
             }
 
-            thread::sleep(Duration::from_millis(30));
+            pace_keepalive_frame(frame_started);
         }
     })
 }
@@ -2948,13 +3278,7 @@ fn try_windows_dynamic_lighting(stop_signal: &Arc<AtomicBool>) -> Option<Keyboar
         );
 
         // Shared color state: the effect callback reads, refresh() writes
-        let shared_state = Arc::new(std::sync::Mutex::new(WinLampColors {
-            rgb_values: [0; 12],
-            brightness: 50,
-            speed: 1,
-            effect_type: BaseEffects::Static,
-            lamp_count,
-        }));
+        let shared_state = Arc::new(std::sync::Mutex::new(blank_win_colors(50, lamp_count)));
 
         let use_wdl_playlist = std::env::var("LEGION_RGB_WDL_USE_PLAYLIST")
             .ok()
@@ -2986,33 +3310,22 @@ fn try_windows_dynamic_lighting(stop_signal: &Arc<AtomicBool>) -> Option<Keyboar
                     callback_heartbeat_clone.fetch_add(1, Ordering::Relaxed);
                     if let Some(args) = args {
                         let state = shared_clone.lock().unwrap();
-                        if !is_vivid_rgb_frame(&state.rgb_values) {
+                        let lamps = resolved_lamps(
+                            &state.rgb_values,
+                            &state.lamp_rgb,
+                            state.per_lamp,
+                            state.lamp_count,
+                        );
+                        if !is_vivid_lamps(&lamps) && !is_vivid_rgb_frame(&state.rgb_values) {
                             // Avoid replaying black/dim frames from transient minimized-state updates.
                             return Ok(());
                         }
-                        let lc = state.lamp_count as usize;
-                        let zones = std::cmp::min(4, lc);
-                        if zones == 0 {
+                        if lamps.is_empty() {
                             return Ok(());
                         }
 
                         let intensity_factor = (state.brightness as f64 / 100.0).clamp(0.01, 1.0);
-
-                        // Divide ALL lamps evenly into 4 zones
-                        for z in 0..zones {
-                            let zone_start = (z * lc) / zones;
-                            let zone_end = ((z + 1) * lc) / zones;
-                            if zone_start >= zone_end {
-                                continue;
-                            }
-                            let r = (state.rgb_values[z * 3] as f64 * intensity_factor) as u8;
-                            let g = (state.rgb_values[z * 3 + 1] as f64 * intensity_factor) as u8;
-                            let b = (state.rgb_values[z * 3 + 2] as f64 * intensity_factor) as u8;
-                            let color = Color { A: 255, R: r, G: g, B: b };
-                            let indices: Vec<i32> =
-                                (zone_start..zone_end).map(|i| i as i32).collect();
-                            let _ = args.SetSingleColorForIndices(color, &indices);
-                        }
+                        paint_lamp_array_args(args, &lamps, intensity_factor);
                     }
                     Ok(())
                 },
@@ -3041,7 +3354,6 @@ fn try_windows_dynamic_lighting(stop_signal: &Arc<AtomicBool>) -> Option<Keyboar
         let shared_lamp = Arc::new(std::sync::Mutex::new(Some(lamp_array)));
         set_controlled_by_foreground_app(true);
         let keepalive_lamp_array = shared_lamp.clone();
-        let reopen_device_id = device_id.clone();
         let keepalive_playlist = playlist.clone();
         let keepalive_state = shared_state.clone();
         let keepalive_callback_heartbeat = callback_heartbeat.clone();
@@ -3055,25 +3367,29 @@ fn try_windows_dynamic_lighting(stop_signal: &Arc<AtomicBool>) -> Option<Keyboar
             let mut focused_ticks: u64 = 0;
             let mut unfocused_ticks: u64 = 0;
             let mut holding_lamp = true;
+            let mut exclusive_hid = false;
             let mut last_logged_focus: Option<bool> = None;
             let mut pending_ambient_off = false;
-            let mut _ambient_hold_on = false;
             let mut last_hold_rgb = [0u8; 12];
             let mut rgb_unchanged_ticks: u64 = 0;
-            const FOCUS_STABLE_TICKS: u64 = 20; // ~600ms at 30ms/tick
             const RGB_STABLE_TICKS: u64 = 70;
             let _ = wdl_hid_fallback_enabled(is_loq_15irx10);
             let _ = wdl_vendor_fallback_enabled(is_loq_15irx10);
-            // Open HID only after we drop WinRT. Holding both at once is the flicker fight.
             let mut raw_hid: Option<(HidDevice, LampArrayReportIds, u16)> = None;
             let vendor_hids: Vec<VendorHidTarget> = Vec::new();
-            log_to_file("Keepalive: WDL while focused; Windows hold + HID after click-away/minimize");
+            let mut last_hid_lamps: Option<Vec<[u8; 3]>> = None;
+            let mut last_hid_intensity: Option<u8> = None;
+            log_to_file("Keepalive: this app is the only lighting source (WDL until HID, then HID stays)");
 
             loop {
-                let (rgb_values, brightness, _speed, _effect_type, lamp_count) = {
+                let frame_started = Instant::now();
+                let mut hid_ms = 0u128;
+                let (rgb_values, lamp_rgb, per_lamp, brightness, _speed, _effect_type, lamp_count) = {
                     let state = keepalive_state.lock().unwrap();
                     (
                         state.rgb_values,
+                        state.lamp_rgb,
+                        state.per_lamp,
                         state.brightness,
                         state.speed,
                         state.effect_type,
@@ -3081,7 +3397,12 @@ fn try_windows_dynamic_lighting(stop_signal: &Arc<AtomicBool>) -> Option<Keyboar
                     )
                 };
 
-                let is_vivid_frame = is_vivid_rgb_frame(&rgb_values);
+                let paint_lamps = resolved_lamps(&rgb_values, &lamp_rgb, per_lamp, lamp_count);
+                let is_vivid_frame = if per_lamp {
+                    is_vivid_lamps(&paint_lamps)
+                } else {
+                    is_vivid_rgb_frame(&rgb_values)
+                };
                 if is_vivid_frame {
                     last_non_black_rgb = rgb_values;
                 }
@@ -3104,8 +3425,8 @@ fn try_windows_dynamic_lighting(stop_signal: &Arc<AtomicBool>) -> Option<Keyboar
                 let window_is_active = keepalive_window_active.load(Ordering::Relaxed);
                 if last_logged_focus != Some(window_is_active) {
                     log_to_file(&format!(
-                        "GUI: window_active={} focused_ticks={} unfocused_ticks={} holding_lamp={}",
-                        window_is_active, focused_ticks, unfocused_ticks, holding_lamp
+                        "GUI: window_active={} focused_ticks={} unfocused_ticks={} holding_lamp={} exclusive_hid={}",
+                        window_is_active, focused_ticks, unfocused_ticks, holding_lamp, exclusive_hid
                     ));
                     last_logged_focus = Some(window_is_active);
                 }
@@ -3117,89 +3438,71 @@ fn try_windows_dynamic_lighting(stop_signal: &Arc<AtomicBool>) -> Option<Keyboar
                     focused_ticks = 0;
                 }
 
-                if holding_lamp {
-                    // Always release on click-away/minimize. Keeping exclusive LampArray
-                    // while unfocused makes Windows ignore our writes, so Swipe/Disco die.
-                    if unfocused_ticks >= FOCUS_STABLE_TICKS && is_vivid_rgb_frame(&hold_rgb) {
-                        log_to_file(&format!(
-                            "UNFOCUS: drop LampArray static_frame={} rgb=[{},{},{} {},{},{} {},{},{} {},{},{}]",
-                            is_static_frame,
-                            hold_rgb[0], hold_rgb[1], hold_rgb[2],
-                            hold_rgb[3], hold_rgb[4], hold_rgb[5],
-                            hold_rgb[6], hold_rgb[7], hold_rgb[8],
-                            hold_rgb[9], hold_rgb[10], hold_rgb[11]
-                        ));
-                        set_controlled_by_foreground_app(false);
+                let intensity = (brightness as f64 / 100.0).clamp(0.01, 1.0);
+                let intensity_byte = (intensity * 255.0) as u8;
+
+                // One-way handoff: paint HID first, then drop WinRT so Windows
+                // never gets a turn. Stay on HID after the window comes back.
+                if !exclusive_hid && unfocused_ticks >= 3 && unfocused_ticks % 3 == 0 {
+                    if raw_hid.is_none() {
+                        raw_hid = open_raw_lamp_array_hid(lamp_count);
+                    }
+                    if raw_hid.is_none() {
                         if let Ok(mut guard) = keepalive_lamp_array.lock() {
                             *guard = None;
                         }
                         holding_lamp = false;
-                        pending_ambient_off = false;
-                        let _ = reg_add_dword(r"HKCU\Software\Microsoft\Lighting", "AmbientLightingEnabled", 0);
-                        raw_hid = None;
                         raw_hid = open_raw_lamp_array_hid(lamp_count);
-                        log_to_file(&format!(
-                            "UNFOCUS: HID LampArray feature reports {}",
-                            if raw_hid.is_some() { "opened" } else { "unavailable" }
-                        ));
-                        log_fight_snapshot("after-drop", false, window_is_active, is_static_frame);
                     }
-                } else if focused_ticks >= 3 {
-                    log_to_file(&format!(
-                        "FIGHT: reopen LampArray focused_ticks={} rgb_unchanged_ticks={}",
-                        focused_ticks, rgb_unchanged_ticks
-                    ));
-                    raw_hid = None;
-                    set_controlled_by_foreground_app(true);
-                    if let Ok(mut guard) = keepalive_lamp_array.lock() {
-                        if guard.is_none() {
-                            *guard = open_wdl_lamp_array(&reopen_device_id);
-                            if guard.is_some() {
-                                log_to_file("WDL: re-acquired LampArray after focus");
-                                pending_ambient_off = true;
-                            }
+                    if let Some((ref dev, ref report_ids, raw_lc)) = raw_hid {
+                        let (_, _, ms) = write_lamp_array_lamps_timed(dev, report_ids, raw_lc, &paint_lamps, intensity_byte);
+                        hid_ms = ms;
+                        if report_ids.control != 0 {
+                            let _ = send_lamp_array_feature(dev, &[report_ids.control, 0x00]);
                         }
+                        sync_windows_hold_color(&hold_rgb, brightness, false);
+                        if let Ok(mut guard) = keepalive_lamp_array.lock() {
+                            *guard = None;
+                        }
+                        keep_app_exclusive_lighting();
+                        holding_lamp = false;
+                        exclusive_hid = true;
+                        pending_ambient_off = false;
+                        log_to_file(&format!(
+                            "UNFOCUS: this app keeps HID exclusive rgb=[{},{},{} {},{},{} {},{},{} {},{},{}]",
+                            paint_rgb[0], paint_rgb[1], paint_rgb[2],
+                            paint_rgb[3], paint_rgb[4], paint_rgb[5],
+                            paint_rgb[6], paint_rgb[7], paint_rgb[8],
+                            paint_rgb[9], paint_rgb[10], paint_rgb[11]
+                        ));
+                        log_fight_snapshot("after-exclusive-hid", false, window_is_active, is_static_frame);
+                    } else {
+                        log_to_file("UNFOCUS: HID LampArray unavailable, keeping WDL until next try");
                     }
-                    holding_lamp = true;
-                    log_fight_snapshot("after-reopen", true, window_is_active, is_static_frame);
                 }
 
-                let lc = lamp_count as usize;
-                let zones = std::cmp::min(4, lc);
-                let intensity = (brightness as f64 / 100.0).clamp(0.01, 1.0);
+                if exclusive_hid {
+                    holding_lamp = false;
+                    // Registry writes on this thread freeze SmoothWave for ~0.5s.
+                    // Re-assert only while the picture is static, never mid-animation.
+                    if is_static_frame && tick % 300 == 0 {
+                        keep_app_exclusive_lighting();
+                    }
+                }
 
-                // --- Path 1: WinRT direct color set only while we hold LampArray ---
-                if holding_lamp {
+                // --- Path 1: WinRT only until this app has taken exclusive HID ---
+                if holding_lamp && !exclusive_hid {
                     if let Ok(guard) = keepalive_lamp_array.lock() {
                         if let Some(ref lamp_array) = *guard {
-                            if zones > 0 {
-                                for z in 0..zones {
-                                    let zone_start = (z * lc) / zones;
-                                    let zone_end = ((z + 1) * lc) / zones;
-                                    if zone_start >= zone_end { continue; }
-                                    let r = (paint_rgb[z * 3] as f64 * intensity) as u8;
-                                    let g = (paint_rgb[z * 3 + 1] as f64 * intensity) as u8;
-                                    let b = (paint_rgb[z * 3 + 2] as f64 * intensity) as u8;
-                                    let color = Color { A: 255, R: r, G: g, B: b };
-                                    let indices: Vec<i32> = (zone_start..zone_end).map(|i| i as i32).collect();
-                                    if let Err(e) = lamp_array.SetSingleColorForIndices(color, &indices) {
-                                        set_color_failures += 1;
-                                        if reverse_engineering_mode_enabled() && set_color_failures % 200 == 1 {
-                                            log_to_file(&format!(
-                                                "RE-WDL [keepalive]: SetSingleColorForIndices failed count={} err={}",
-                                                set_color_failures, e
-                                            ));
-                                        }
-                                    }
-                                }
+                            let wdl_started = Instant::now();
+                            if !paint_lamp_array(lamp_array, &paint_lamps, intensity) {
+                                set_color_failures += 1;
                             }
+                            hid_ms = wdl_started.elapsed().as_millis();
                         }
                     }
                     if pending_ambient_off {
-                        let _ = reg_add_dword(r"HKCU\Software\Microsoft\Lighting", "AmbientLightingEnabled", 0);
-                        for device_key in reg_query_subkeys(r"HKCU\Software\Microsoft\Lighting\Devices") {
-                            let _ = reg_add_dword(&device_key, "AmbientLightingEnabled", 0);
-                        }
+                        keep_app_exclusive_lighting();
                         pending_ambient_off = false;
                         log_to_file("WDL: Windows hold lighting off while this app is in control");
                     }
@@ -3228,56 +3531,53 @@ fn try_windows_dynamic_lighting(stop_signal: &Arc<AtomicBool>) -> Option<Keyboar
                     last_callback_heartbeat = callback_now;
                 }
 
-                // After click-away we do not hold WinRT. Paint the real 4-zone
-                // frames through HID LampArray feature reports (host control).
-                if !holding_lamp {
+                if exclusive_hid || !holding_lamp {
                     if let Some((ref dev, ref report_ids, raw_lc)) = raw_hid {
-                        let intensity_byte = (intensity * 255.0) as u8;
-                        write_lamp_array_zones(dev, report_ids, raw_lc, &paint_rgb, intensity_byte);
-                        if report_ids.control != 0 && tick % 20 == 0 {
+                        let hid_changed = last_hid_lamps.as_ref() != Some(&paint_lamps) || last_hid_intensity != Some(intensity_byte);
+                        if hid_changed || (is_static_frame && tick % 30 == 0) {
+                            let (_, _, ms) = write_lamp_array_lamps_timed(dev, report_ids, raw_lc, &paint_lamps, intensity_byte);
+                            hid_ms = ms;
+                            last_hid_lamps = Some(paint_lamps.clone());
+                            last_hid_intensity = Some(intensity_byte);
+                        }
+                        if report_ids.control != 0 && is_static_frame && tick % 300 == 0 {
                             let _ = send_lamp_array_feature(dev, &[report_ids.control, 0x00]);
                         }
-                    } else if tick % 60 == 0 {
+                    } else if tick % 30 == 0 {
                         raw_hid = open_raw_lamp_array_hid(lamp_count);
+                        if raw_hid.is_some() {
+                            exclusive_hid = true;
+                            holding_lamp = false;
+                            keep_app_exclusive_lighting();
+                            if let Ok(mut guard) = keepalive_lamp_array.lock() {
+                                *guard = None;
+                            }
+                            log_to_file("HID: exclusive LampArray feature reports opened");
+                        }
                     }
                 }
 
-                // --- Minimal logging every ~5s (only when raw HID is active) ---
+                // --- Minimal logging every ~5s ---
                 tick += 1;
-                if tick % 800 == 0 {
-                    log_fight_snapshot("periodic", holding_lamp, window_is_active, is_static_frame);
+                let loop_ms = frame_started.elapsed().as_millis();
+                if loop_ms >= 20 {
                     log_to_file(&format!(
-                        "Keepalive: raw_hid={}, vendor_hids={}, gen7={}, window_active={}, holding_lamp={}, static_frame={}, tick={}, callback_heartbeat={}, callback_stall_ticks={}, set_color_failures={}, rgb=[{},{},{},{},{},{},{},{},{},{},{},{}]",
-                        raw_hid.is_some(), vendor_hids.len(),
-                        vendor_hids.iter().any(|target| target.gen7_controller.is_some()),
-                        keepalive_window_active.load(Ordering::Relaxed),
-                        holding_lamp,
-                        is_static_frame,
-                        tick,
-                        callback_now,
-                        callback_stall_ticks,
-                        set_color_failures,
-                        paint_rgb[0], paint_rgb[1], paint_rgb[2],
-                        paint_rgb[3], paint_rgb[4], paint_rgb[5],
-                        paint_rgb[6], paint_rgb[7], paint_rgb[8],
-                        paint_rgb[9], paint_rgb[10], paint_rgb[11]
+                        "KEEP: stall loop_ms={loop_ms} hid_ms={hid_ms} per_lamp={per_lamp} exclusive_hid={exclusive_hid} static={is_static_frame} lamps={}",
+                        paint_lamps.len()
                     ));
                 }
+                if is_static_frame && tick % 1800 == 0 {
+                    log_fight_snapshot("periodic", holding_lamp, window_is_active, is_static_frame);
+                }
 
-                // Sleep is reduced to 30ms so raw HID writes happen ~33 times/sec
-                thread::sleep(Duration::from_millis(30));
+                pace_keepalive_frame(frame_started);
             }
         });
 
         #[cfg(debug_assertions)]
         eprintln!("[DEBUG] Windows Dynamic Lighting: effect playlist started (persistent control)");
 
-        let current_state = LightingState {
-            effect_type: BaseEffects::Static,
-            speed: 1,
-            brightness: 50,
-            rgb_values: [0; 12],
-        };
+        let current_state = blank_lighting(50);
 
         return Some(Keyboard {
             keyboard_hid: None,
@@ -3342,7 +3642,7 @@ pub fn get_keyboard(stop_signal: Arc<AtomicBool>) -> Result<Keyboard> {
     // --- LOQ 15IRX10 dedicated flow ---
     #[cfg(target_os = "windows")]
     if is_loq_15irx10 {
-        log_to_file("LOQ 15IRX10 detected: WDL while focused; Windows hold lighting after click-away");
+        log_to_file("LOQ 15IRX10 detected: this app owns lighting; HID stays after click-away");
 
         if should_disable_windows_ambient_lighting_for_loq() {
             disable_windows_dynamic_lighting_ambient();
@@ -3462,12 +3762,7 @@ pub fn get_keyboard(stop_signal: Arc<AtomicBool>) -> Result<Keyboard> {
     #[cfg(debug_assertions)]
     eprintln!("[DEBUG] Device opened successfully");
 
-    let current_state: LightingState = LightingState {
-        effect_type: BaseEffects::Static,
-        speed: 1,
-        brightness: 1,
-        rgb_values: [0; 12],
-    };
+    let current_state: LightingState = blank_lighting(1);
 
     let mut keyboard = Keyboard {
         keyboard_hid: Some(keyboard_hid),

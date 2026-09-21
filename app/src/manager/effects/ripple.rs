@@ -11,20 +11,18 @@ use std::{
 use device_query::{DeviceEvents, DeviceEventsHandler, Keycode};
 
 use crate::manager::{
+    effects::lamps,
     profile::Profile,
     {effects::zones::KEY_ZONES, Inner},
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RippleMove {
-    Center,
-    Left,
-    Right,
-    Off,
+struct Pulse {
+    origin: f32,
+    age: f32,
 }
 
 pub fn play(manager: &mut Inner, p: &Profile) {
-    legion_rgb_driver::debug_log("EFFECT: ripple (direct zone paint)");
+    legion_rgb_driver::debug_log("EFFECT: ripple (smooth wave)");
     let kill_thread = Arc::new(AtomicBool::new(false));
     let exit_thread = kill_thread.clone();
 
@@ -36,12 +34,7 @@ pub fn play(manager: &mut Inner, p: &Profile) {
     let (tx, rx) = crossbeam_channel::unbounded::<Event>();
 
     thread::spawn(move || {
-        // Do this in order to avoid having to store the event handler struct somewhere,
-        // since it saves no data and serves only as a fancy function proxy for interacting with the real event loop
-        // This keeps the effect self contained, and other effects should probably use the same pattern
-        let event_handler = DeviceEventsHandler::new(Duration::from_millis(10)).unwrap_or(DeviceEventsHandler {});
-
-        // tx_clone.send(Event::KeyPress(Keycode::Meta)).unwrap();
+        let event_handler = DeviceEventsHandler::new(Duration::from_millis(8)).unwrap_or(DeviceEventsHandler {});
         let tx_clone = tx.clone();
 
         let press_guard = event_handler.on_key_down(move |key| {
@@ -58,26 +51,26 @@ pub fn play(manager: &mut Inner, p: &Profile) {
                 drop(release_guard);
                 break;
             }
-
             thread::sleep(Duration::from_millis(5));
         }
     });
 
+    let n = manager.lamp_n();
     let mut zone_pressed: [HashSet<Keycode>; 4] = [HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new()];
-    let mut zone_state: [RippleMove; 4] = [RippleMove::Off, RippleMove::Off, RippleMove::Off, RippleMove::Off];
-
-    let mut last_step_time = Instant::now();
+    let mut was_pressed = [false; 4];
+    let mut brightness = vec![0.0f32; n];
+    let mut pulses: Vec<Pulse> = Vec::new();
+    let mut last_tick = Instant::now();
 
     while !manager.stop_signals.manager_stop_signal.load(Ordering::SeqCst) {
-        match rx.try_recv() {
-            Ok(event) => match event {
+        for event in rx.try_iter() {
+            match event {
                 Event::KeyPress(key) => {
                     for (i, zone) in KEY_ZONES.iter().enumerate() {
                         if zone.contains(&key) {
                             zone_pressed[i].insert(key);
                         }
                     }
-
                 }
                 Event::KeyRelease(key) => {
                     for (i, zone) in KEY_ZONES.iter().enumerate() {
@@ -86,19 +79,64 @@ pub fn play(manager: &mut Inner, p: &Profile) {
                         }
                     }
                 }
-            },
-            Err(err) => {
-                if err == crossbeam_channel::TryRecvError::Disconnected {
-                    break;
-                }
             }
         }
 
-        zone_state = advance_zone_state(zone_state, &mut last_step_time, &p.speed);
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(last_tick).as_secs_f32().clamp(0.008, 0.05);
+        last_tick = now;
 
-        for (i, pressed) in zone_pressed.iter().enumerate() {
-            if !pressed.is_empty() {
-                zone_state[i] = RippleMove::Center;
+        let speed = manager.effect_speed.load(Ordering::Relaxed).clamp(1, 10) as f32;
+        let spread = (2.4 + speed * 0.85) * n as f32 / 4.0;
+        let lifetime = (1.15 - speed * 0.055).clamp(0.55, 1.15);
+        let width = 0.85 * n as f32 / 4.0;
+
+        for i in 0..4 {
+            let pressed = !zone_pressed[i].is_empty();
+            if pressed && !was_pressed[i] {
+                pulses.push(Pulse {
+                    origin: (i as f32 + 0.5) * n as f32 / 4.0,
+                    age: 0.0,
+                });
+                if pulses.len() > 12 {
+                    pulses.remove(0);
+                }
+            }
+            was_pressed[i] = pressed;
+        }
+
+        for pulse in pulses.iter_mut() {
+            pulse.age += dt;
+        }
+        pulses.retain(|pulse| pulse.age < lifetime * 1.35);
+
+        let mut target = vec![0.0f32; n];
+        for pulse in &pulses {
+            let radius = pulse.age * spread;
+            let fade = (1.0 - pulse.age / lifetime).clamp(0.0, 1.0).powf(1.15);
+            let origin_glow = (-pulse.age / 0.16).exp();
+            for z in 0..n {
+                let dist = (z as f32 - pulse.origin).abs();
+                let ring = (-((dist - radius) * (dist - radius)) / (2.0 * width * width)).exp();
+                let center = (-dist * dist / (0.55 * n as f32 / 4.0)).exp() * origin_glow;
+                target[z] = target[z].max((ring * fade + center * 0.7).clamp(0.0, 1.0));
+            }
+        }
+        for i in 0..4 {
+            if was_pressed[i] {
+                let start = (i * n) / 4;
+                let end = ((i + 1) * n) / 4;
+                for z in start..end {
+                    target[z] = target[z].max(0.62);
+                }
+            }
+        }
+        for i in 0..n {
+            let tau = if target[i] > brightness[i] { 0.04 } else { 0.14 };
+            let alpha = 1.0 - (-dt / tau).exp();
+            brightness[i] += (target[i] - brightness[i]) * alpha;
+            if brightness[i] < 0.008 {
+                brightness[i] = 0.0;
             }
         }
 
@@ -106,66 +144,15 @@ pub fn play(manager: &mut Inner, p: &Profile) {
         if rgb_array.iter().all(|&c| c == 0) {
             rgb_array = [255, 40, 80, 255, 160, 40, 40, 220, 120, 80, 120, 255];
         }
-        let mut final_arr: [u8; 12] = [0; 12];
-
-        for (i, ripple_move) in zone_state.iter().enumerate() {
-            if ripple_move != &RippleMove::Off {
-                final_arr[(i * 3)..((i * 3) + 3)].copy_from_slice(&rgb_array[(i * 3)..((i * 3) + 3)]);
-            }
-        }
-
-        manager.keyboard.set_colors_to(&final_arr).unwrap();
-        let step_ms = (80 / p.speed.max(1) as u64).clamp(16, 80);
-        thread::sleep(Duration::from_millis(step_ms));
+        let lamps: Vec<[u8; 3]> = (0..n)
+            .map(|i| {
+                let amount = brightness[i].clamp(0.0, 1.0).powf(1.12);
+                lamps::scale_rgb(lamps::sample_zones(&rgb_array, lamps::pos(i, n)), amount)
+            })
+            .collect();
+        manager.paint_lamps(&lamps);
+        thread::sleep(Duration::from_millis(if n > 4 { 33 } else { 16 }));
     }
 
     kill_thread.store(true, Ordering::SeqCst);
-}
-
-fn advance_zone_state(zone_state: [RippleMove; 4], last_step_time: &mut Instant, speed: &u8) -> [RippleMove; 4] {
-    let now = Instant::now();
-
-    if now - *last_step_time > Duration::from_millis((200 / *speed) as u64) {
-        let mut new_state: [RippleMove; 4] = [RippleMove::Off, RippleMove::Off, RippleMove::Off, RippleMove::Off];
-
-        *last_step_time = now;
-
-        // Process moves first, then add centers
-        for (i, zone_move) in zone_state.iter().enumerate() {
-            match zone_move {
-                RippleMove::Left => {
-                    if i != 0 {
-                        if let Some(left) = new_state.get_mut(i - 1) {
-                            *left = RippleMove::Left;
-                        }
-                    }
-                }
-
-                RippleMove::Right => {
-                    if let Some(right) = new_state.get_mut(i + 1) {
-                        *right = RippleMove::Right;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        for (i, ripple_move) in zone_state.iter().enumerate() {
-            if matches!(ripple_move, RippleMove::Center) {
-                if i != 0 {
-                    if let Some(left) = new_state.get_mut(i - 1) {
-                        *left = RippleMove::Left;
-                    }
-                }
-
-                if let Some(right) = new_state.get_mut(i + 1) {
-                    *right = RippleMove::Right;
-                }
-            }
-        }
-
-        new_state
-    } else {
-        zone_state
-    }
 }

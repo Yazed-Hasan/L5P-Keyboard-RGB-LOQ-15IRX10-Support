@@ -215,6 +215,7 @@ fn parse_cli() -> Result<CliOutput, CliError> {
                     speed,
                     brightness,
                     brightness_level: 50,
+                    lamp_rgb: Vec::new(),
                 };
 
                 if let Some(filename) = save {
